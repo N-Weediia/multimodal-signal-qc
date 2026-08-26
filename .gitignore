@@ -1,0 +1,14 @@
+# IDE and local agent state
+.idea/
+.claude/
+
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Raw recordings and generated analysis artifacts
+data/
+preprocessed_*/
+results/
+results_*/
