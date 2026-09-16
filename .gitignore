@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+demo_outputs/
+*.nirs
+*.bdf
+*.edf
+*.csv
+*.npz
+*.mat
