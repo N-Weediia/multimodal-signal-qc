@@ -301,7 +301,15 @@ def assess_emg_channel(series: EMGSeries) -> EMGChannelMetrics:
     zero_percent = float(np.mean(values == 0) * 100.0)
     minimum = float(np.min(values))
     maximum = float(np.max(values))
-    repeated_extreme = float(max(np.mean(values == minimum), np.mean(values == maximum)) * 100.0)
+    repeated_extreme = (
+        100.0
+        / max(1, values.size)
+        * max(
+            0,
+            int(np.count_nonzero(values == minimum)) - 1,
+            int(np.count_nonzero(values == maximum)) - 1,
+        )
+    )
 
     epoch_samples = max(2, int(round(EMG_EPOCH_SECONDS * series.sample_rate_hz)))
     epoch_count = values.size // epoch_samples
@@ -335,6 +343,9 @@ def assess_emg_channel(series: EMGSeries) -> EMGChannelMetrics:
     elif missing_percent >= 0.5:
         score -= 20
         reasons.append(f"估计丢样 {missing_percent:.2f}%")
+    elif np.isfinite(maximum_gap_ms) and maximum_gap_ms >= 500.0:
+        score -= 15
+        reasons.append(f"存在最大采样间隔跳变 {maximum_gap_ms:.1f} ms")
     if flat_percent >= 10.0 or robust_std == 0:
         score -= 50
         reasons.append(f"平线分段 {flat_percent:.1f}%")
@@ -347,7 +358,10 @@ def assess_emg_channel(series: EMGSeries) -> EMGChannelMetrics:
     elif repeated_extreme >= 0.1:
         score -= 15
         reasons.append(f"重复极值采样 {repeated_extreme:.2f}%")
-    if line_percent >= 20.0:
+    if line_percent >= 85.0:
+        score -= 50
+        reasons.append(f"50 Hz 及谐波主导功率占比极高 {line_percent:.1f}%（疑似电极悬空/脱落）")
+    elif line_percent >= 20.0:
         score -= 30
         reasons.append(f"50 Hz 及谐波功率占 EMG 频带 {line_percent:.1f}%")
     elif line_percent >= 5.0:
@@ -564,7 +578,8 @@ def analyze_emg_recording(recording: Path, output_directory: Path, max_seconds: 
             "missing_sample_caution_percent": 0.5,
             "missing_sample_poor_percent": 5.0,
             "line_noise_caution_percent": 5.0,
-            "line_noise_poor_percent": 20.0,
+            "maximum_timestamp_gap_caution_ms": 500.0,
+            "line_noise_poor_percent": 85.0,
         },
     }
     (output_directory / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

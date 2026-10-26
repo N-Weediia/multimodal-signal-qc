@@ -448,15 +448,19 @@ def _plot_preview(recording: FNIRSRecording, metrics: list[FNIRSChannelMetrics],
     for axis, channel in zip(axes, selected):
         a = _fill_invalid(channel.intensity_a[:points])
         b = _fill_invalid(channel.intensity_b[:points])
-        od_a = -np.log(a / np.median(a))
-        od_b = -np.log(b / np.median(b))
         relative_time = recording.time[:points] - recording.time[0]
-        axis.plot(relative_time, od_a, color="#457b9d", linewidth=0.8, label=f"{channel.wavelength_a_nm:.0f} nm")
-        axis.plot(relative_time, od_b, color="#e76f51", linewidth=0.8, label=f"{channel.wavelength_b_nm:.0f} nm")
+        if np.all(np.isfinite(a)) and np.median(a) > 0:
+            od_a = -np.log(a / np.median(a))
+            axis.plot(relative_time, od_a, color="#457b9d", linewidth=0.8, label=f"{channel.wavelength_a_nm:.0f} nm")
+        if np.all(np.isfinite(b)) and np.median(b) > 0:
+            od_b = -np.log(b / np.median(b))
+            axis.plot(relative_time, od_b, color="#e76f51", linewidth=0.8, label=f"{channel.wavelength_b_nm:.0f} nm")
         axis.set_ylabel(f"CH{channel.channel_number:02d}\nOD")
         axis.grid(alpha=0.2)
     axes[0].set_title("质量分最低的 6 个 fNIRS 通道（光密度变化）")
-    axes[0].legend(ncol=2)
+    handles, _ = axes[0].get_legend_handles_labels()
+    if handles:
+        axes[0].legend(ncol=2)
     axes[-1].set_xlabel("时间（s）")
     fig.savefig(destination, dpi=180)
     plt.close(fig)
@@ -466,11 +470,13 @@ def _plot_spectra(recording: FNIRSRecording, destination: Path) -> None:
     fig, axis = plt.subplots(figsize=(10, 6), constrained_layout=True)
     for channel in recording.channels:
         a = _fill_invalid(channel.intensity_a)
+        if not np.all(np.isfinite(a)) or np.median(a) <= 0 or a.size < 8:
+            continue
         optical_density = -np.log(a / np.median(a))
         frequencies, spectrum = signal.welch(
             optical_density,
             fs=recording.sample_rate_hz,
-            nperseg=min(max(64, int(round(recording.sample_rate_hz * 20))), optical_density.size),
+            nperseg=min(max(8, min(64, optical_density.size)), max(8, int(round(recording.sample_rate_hz * 20))), optical_density.size),
         )
         mask = frequencies <= min(3.0, recording.sample_rate_hz * 0.48)
         axis.semilogy(frequencies[mask], spectrum[mask], color="#457b9d", alpha=0.18, linewidth=0.7)
