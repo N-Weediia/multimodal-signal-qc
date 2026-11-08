@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,9 +13,29 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import numpy as np
 from scipy import signal
 from scipy.io import loadmat
+
+
+def _configure_matplotlib_font() -> None:
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    for candidate in ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC"):
+        if candidate in available:
+            plt.rcParams["font.family"] = ["sans-serif"]
+            plt.rcParams["font.sans-serif"] = [candidate, "DejaVu Sans"]
+            break
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+_configure_matplotlib_font()
+
+
+def _assert_safe_output_directory(destination: Path) -> None:
+    resolved = destination.resolve()
+    if resolved.drive.upper() == "J:" or str(resolved).startswith("\\\\?\\J:"):
+        raise PermissionError(f"严禁向只读原始数据盘 J: 写入任何文件：{resolved}")
 
 
 SCI_BAND_HZ = (0.5, 2.5)
@@ -29,6 +49,7 @@ MOTION_POOR_PERCENT = 20.0
 MOTION_MINIMUM_OD_STEP = 0.03
 MOTION_MAD_MULTIPLIER = 12.0
 MOTION_PADDING_SECONDS = 0.5
+FNIRS_GAP_RINGING_PADDING_SECONDS = 3.0
 
 
 @dataclass
@@ -51,6 +72,7 @@ class FNIRSRecording:
     channels: list[FNIRSChannelSeries]
     source_positions: np.ndarray
     detector_positions: np.ndarray
+    marker_times_seconds: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
 
 
 @dataclass
@@ -76,8 +98,15 @@ class FNIRSChannelMetrics:
 
 
 def is_infrared_eye_tracking_task(path: Path) -> bool:
-    task_text = f"{path.parent.name} {path.stem}".casefold()
-    return "眼动" in task_text or "eye" in task_text
+    """Return whether a recording is in an eye-tracking task directory.
+
+    The recording filename is deliberately ignored because vendor exports may
+    retain a stale task name after files are reorganized.
+    """
+    return any(
+        "眼动" in directory.casefold() or "eye" in directory.casefold()
+        for directory in path.parent.parts
+    )
 
 
 def _as_two_dimensional_positions(value: Any, name: str) -> np.ndarray:
@@ -89,8 +118,40 @@ def _as_two_dimensional_positions(value: Any, name: str) -> np.ndarray:
     return positions[:, :2]
 
 
+def _deduplicate_fnirs_markers(time: np.ndarray, marker_matrix: Any, merge_window_seconds: float = 1.0) -> np.ndarray:
+    """Extract and deduplicate NirSmart stimulus triggers within 1.0 s window."""
+    if marker_matrix is None:
+        return np.empty(0, dtype=float)
+    marker = np.asarray(marker_matrix)
+    if marker.size == 0:
+        return np.empty(0, dtype=float)
+    if marker.ndim == 1:
+        if marker.shape[0] != time.size:
+            return np.empty(0, dtype=float)
+        indices = np.flatnonzero(marker != 0)
+    elif marker.ndim == 2:
+        if marker.shape[0] != time.size and marker.shape[1] == time.size:
+            marker = marker.T
+        if marker.shape[0] != time.size:
+            return np.empty(0, dtype=float)
+        indices = np.flatnonzero(np.any(marker != 0, axis=1))
+    else:
+        return np.empty(0, dtype=float)
+    if not indices.size:
+        return np.empty(0, dtype=float)
+    raw_times = time[indices]
+    kept = [float(raw_times[0])]
+    for value in raw_times[1:]:
+        current = float(value)
+        if current - kept[-1] > merge_window_seconds:
+            kept.append(current)
+        elif current < kept[-1]:
+            kept[-1] = current
+    return np.asarray(kept, dtype=float)
+
+
 def read_fnirs(path: Path, max_seconds: float | None) -> FNIRSRecording:
-    document = loadmat(path, variable_names=["d", "t", "ml", "SD"], simplify_cells=True)
+    document = loadmat(path, variable_names=["d", "t", "ml", "SD", "s"], simplify_cells=True)
     missing = [key for key in ("d", "t", "SD") if key not in document]
     if missing:
         raise ValueError(f"NIRS 文件缺少必要变量：{', '.join(missing)}")
@@ -109,10 +170,16 @@ def read_fnirs(path: Path, max_seconds: float | None) -> FNIRSRecording:
     if positive_differences.size == 0:
         raise ValueError("NIRS 时间向量无法确定采样率。")
     sample_rate = 1.0 / float(np.median(positive_differences))
+    raw_marker = document.get("s")
     if max_seconds is not None:
         keep = time <= time[0] + max_seconds
         time = time[keep]
         data = data[keep]
+        if raw_marker is not None:
+            marker_arr = np.asarray(raw_marker)
+            if marker_arr.ndim >= 1 and marker_arr.shape[0] == keep.size:
+                raw_marker = marker_arr[keep]
+    marker_times = _deduplicate_fnirs_markers(time, raw_marker)
 
     sd = document["SD"]
     if not isinstance(sd, dict):
@@ -170,16 +237,35 @@ def read_fnirs(path: Path, max_seconds: float | None) -> FNIRSRecording:
         channels=channels,
         source_positions=source_positions,
         detector_positions=detector_positions,
+        marker_times_seconds=marker_times,
     )
 
 
-def _fill_invalid(values: np.ndarray) -> np.ndarray:
+def _fill_invalid(values: np.ndarray, max_gap_samples: int | None = None) -> np.ndarray:
+    """Interpolate invalid runs, optionally limiting the run length.
+
+    With a limit, long gaps stay NaN so downstream code can exclude them
+    rather than inventing a slow hemodynamic trajectory across a dropout.
+    The default preserves the historical all-gap behavior for QC diagnostics.
+    """
     result = np.asarray(values, dtype=float).copy()
     valid = np.isfinite(result) & (result > 0)
     if np.count_nonzero(valid) < 2:
         return np.full_like(result, np.nan)
+    invalid_indices = np.flatnonzero(~valid)
+    if max_gap_samples is None:
+        indices = np.arange(result.size)
+        result[~valid] = np.interp(indices[~valid], indices[valid], result[valid])
+        return result
+    if invalid_indices.size == 0:
+        return result
+    result[~valid] = np.nan
+    starts = invalid_indices[np.r_[True, np.diff(invalid_indices) > 1]]
+    ends = invalid_indices[np.r_[np.diff(invalid_indices) > 1, True]]
     indices = np.arange(result.size)
-    result[~valid] = np.interp(indices[~valid], indices[valid], result[valid])
+    for start, end in zip(starts, ends):
+        if end - start + 1 <= max_gap_samples:
+            result[start:end + 1] = np.interp(indices[start:end + 1], indices[valid], result[valid])
     return result
 
 
@@ -202,7 +288,13 @@ def _scalp_coupling_index(a: np.ndarray, b: np.ndarray, sample_rate: float) -> f
     return float(np.sum(filtered_a * filtered_b) / denominator)
 
 
-def _motion_artifact_percent(a: np.ndarray, b: np.ndarray, sample_rate: float) -> float:
+def _motion_artifact_mask(a: np.ndarray, b: np.ndarray, sample_rate: float) -> np.ndarray:
+    """Return a conservative time mask for abrupt optical-density changes.
+
+    The mask is evidence for downstream gating, not a claim that the source
+    of the change was head motion.  This distinction matters for eye-tracker
+    recordings where optical contamination and motion can coexist.
+    """
     motion = np.zeros(a.size, dtype=bool)
     for values in (a, b):
         optical_density = -np.log(values / np.median(values))
@@ -219,7 +311,123 @@ def _motion_artifact_percent(a: np.ndarray, b: np.ndarray, sample_rate: float) -
         motion |= derivative > threshold
     padding = max(1, int(round(sample_rate * MOTION_PADDING_SECONDS)))
     expanded = np.convolve(motion.astype(int), np.ones(2 * padding + 1, dtype=int), mode="same") > 0
-    return float(np.mean(expanded) * 100.0)
+    return expanded
+
+
+def _motion_artifact_percent(a: np.ndarray, b: np.ndarray, sample_rate: float) -> float:
+    return float(np.mean(_motion_artifact_mask(a, b, sample_rate)) * 100.0)
+
+
+def detect_fnirs_uncoupled_boundary_mask(recording: FNIRSRecording) -> np.ndarray:
+    """Detect leading/trailing cap-off segments (e.g. cap put on late or removed early).
+
+    Only contiguous boundary segments on recordings >= 90 s whose interior body
+    shows clear cardiac scalp coupling (median SCI >= 0.55) while boundary 15 s
+    windows show near-zero coupling (median SCI < 0.20) are flagged.
+    """
+    n_samples = recording.time.size
+    mask = np.zeros(n_samples, dtype=bool)
+    fs = recording.sample_rate_hz
+    win_samples = max(8, int(round(15.0 * fs)))
+    n_wins = n_samples // win_samples
+    if n_wins < 6 or not recording.channels:
+        return mask
+    win_sci = np.full(n_wins, np.nan, dtype=float)
+    for w in range(n_wins):
+        s0, s1 = w * win_samples, (w + 1) * win_samples
+        scis: list[float] = []
+        for ch in recording.channels:
+            ca = _fill_invalid(ch.intensity_a[s0:s1])
+            cb = _fill_invalid(ch.intensity_b[s0:s1])
+            if np.all(np.isfinite(ca)) and np.all(np.isfinite(cb)):
+                val = _scalp_coupling_index(ca, cb, fs)
+                if np.isfinite(val):
+                    scis.append(val)
+        win_sci[w] = float(np.median(scis)) if scis else 0.0
+    if float(np.nanpercentile(win_sci, 75)) < 0.55:
+        return mask
+    lead = 0
+    while lead < n_wins // 3 and win_sci[lead] < 0.20:
+        lead += 1
+    trail = 0
+    while trail < n_wins // 3 and win_sci[n_wins - 1 - trail] < 0.20:
+        trail += 1
+    if lead > 0:
+        mask[: lead * win_samples] = True
+    if trail > 0:
+        mask[(n_wins - trail) * win_samples :] = True
+    return mask
+
+
+def build_fnirs_sample_masks(
+    channel: FNIRSChannelSeries,
+    sample_rate: float,
+    time: np.ndarray | None = None,
+    uncoupled_sample_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build wavelength-valid, motion, repair, and analysis masks.
+
+    Invalid/non-positive samples are linearly filled only to keep filters
+    numerically stable; they remain excluded by ``analysis_sample_mask``.
+    Long invalid dropouts (> 1 s) and non-uniform timestamp jumps (> 0.5 s)
+    also expand ``motion`` by ``FNIRS_GAP_RINGING_PADDING_SECONDS`` on both
+    edges so bandpass step/ramp ringing never leaks into downstream statistics.
+    """
+    wavelength_valid = np.stack([
+        np.isfinite(channel.intensity_a) & (channel.intensity_a > 0),
+        np.isfinite(channel.intensity_b) & (channel.intensity_b > 0),
+    ])
+    sample_valid = np.all(wavelength_valid, axis=0)
+    max_gap_samples = max(1, int(round(sample_rate * 1.0)))
+    filled_a = _fill_invalid(channel.intensity_a, max_gap_samples)
+    filled_b = _fill_invalid(channel.intensity_b, max_gap_samples)
+    full_a = _fill_invalid(channel.intensity_a)
+    full_b = _fill_invalid(channel.intensity_b)
+    if np.all(np.isfinite(full_a)) and np.all(np.isfinite(full_b)):
+        motion = _motion_artifact_mask(full_a, full_b, sample_rate)
+    else:
+        motion = np.zeros(sample_valid.size, dtype=bool)
+    long_gap = (~np.isfinite(filled_a)) | (~np.isfinite(filled_b))
+    time_jump = np.zeros(sample_valid.size, dtype=bool)
+    if time is not None and time.size == sample_valid.size and time.size >= 2:
+        dt = np.diff(time)
+        jump_idx = np.flatnonzero(dt > max(0.5, 3.0 / max(sample_rate, 1e-6)))
+        if jump_idx.size:
+            time_jump[jump_idx] = True
+            time_jump[np.minimum(jump_idx + 1, sample_valid.size - 1)] = True
+    ringing_seeds = long_gap | time_jump
+    if np.any(ringing_seeds):
+        ring_pad = max(1, int(round(sample_rate * FNIRS_GAP_RINGING_PADDING_SECONDS)))
+        dilated_ringing = np.convolve(ringing_seeds.astype(int), np.ones(2 * ring_pad + 1, dtype=int), mode="same") > 0
+        motion = motion | dilated_ringing
+    if uncoupled_sample_mask is not None and uncoupled_sample_mask.size == sample_valid.size:
+        motion = motion | np.asarray(uncoupled_sample_mask, dtype=bool)
+    repair = (~sample_valid) | motion
+    analysis = sample_valid & ~motion
+    return wavelength_valid, motion, repair, analysis
+
+
+def motion_artifact_level(a: np.ndarray, b: np.ndarray, sample_rate: float) -> np.ndarray:
+    """Classify optical-density motion evidence into 0/1/2 severity tiers."""
+    levels = np.zeros(a.size, dtype=np.int8)
+    for values in (a, b):
+        finite = np.asarray(values, dtype=float)
+        finite = _fill_invalid(finite)
+        if not np.all(np.isfinite(finite)):
+            continue
+        od = -np.log(finite / np.median(finite))
+        derivative = np.abs(np.diff(od, prepend=od[0]))
+        median = float(np.median(derivative))
+        mad = float(np.median(np.abs(derivative - median)) * 1.4826)
+        adaptive = median + max(MOTION_MAD_MULTIPLIER * mad, np.finfo(float).eps)
+        mild = np.maximum(MOTION_MINIMUM_OD_STEP * 0.5, adaptive)
+        severe = np.maximum(MOTION_MINIMUM_OD_STEP * 2.0, adaptive * 2.0)
+        levels = np.maximum(levels, np.where(derivative > severe, 2, np.where(derivative > mild, 1, 0)).astype(np.int8))
+    padding = max(1, int(round(sample_rate * MOTION_PADDING_SECONDS)))
+    severe_mask = levels >= 2
+    expanded = np.convolve(severe_mask.astype(int), np.ones(2 * padding + 1, dtype=int), mode="same") > 0
+    levels[expanded] = np.maximum(levels[expanded], 2)
+    return levels
 
 
 def assess_fnirs_channel(channel: FNIRSChannelSeries, sample_rate: float) -> FNIRSChannelMetrics:
@@ -362,15 +570,19 @@ def _plot_preview(recording: FNIRSRecording, metrics: list[FNIRSChannelMetrics],
     for axis, channel in zip(axes, selected):
         a = _fill_invalid(channel.intensity_a[:points])
         b = _fill_invalid(channel.intensity_b[:points])
-        od_a = -np.log(a / np.median(a))
-        od_b = -np.log(b / np.median(b))
         relative_time = recording.time[:points] - recording.time[0]
-        axis.plot(relative_time, od_a, color="#457b9d", linewidth=0.8, label=f"{channel.wavelength_a_nm:.0f} nm")
-        axis.plot(relative_time, od_b, color="#e76f51", linewidth=0.8, label=f"{channel.wavelength_b_nm:.0f} nm")
+        if np.all(np.isfinite(a)) and np.median(a) > 0:
+            od_a = -np.log(a / np.median(a))
+            axis.plot(relative_time, od_a, color="#457b9d", linewidth=0.8, label=f"{channel.wavelength_a_nm:.0f} nm")
+        if np.all(np.isfinite(b)) and np.median(b) > 0:
+            od_b = -np.log(b / np.median(b))
+            axis.plot(relative_time, od_b, color="#e76f51", linewidth=0.8, label=f"{channel.wavelength_b_nm:.0f} nm")
         axis.set_ylabel(f"CH{channel.channel_number:02d}\nOD")
         axis.grid(alpha=0.2)
     axes[0].set_title("质量分最低的 6 个 fNIRS 通道（光密度变化）")
-    axes[0].legend(ncol=2)
+    handles, _ = axes[0].get_legend_handles_labels()
+    if handles:
+        axes[0].legend(ncol=2)
     axes[-1].set_xlabel("时间（s）")
     fig.savefig(destination, dpi=180)
     plt.close(fig)
@@ -380,11 +592,13 @@ def _plot_spectra(recording: FNIRSRecording, destination: Path) -> None:
     fig, axis = plt.subplots(figsize=(10, 6), constrained_layout=True)
     for channel in recording.channels:
         a = _fill_invalid(channel.intensity_a)
+        if not np.all(np.isfinite(a)) or np.median(a) <= 0 or a.size < 8:
+            continue
         optical_density = -np.log(a / np.median(a))
         frequencies, spectrum = signal.welch(
             optical_density,
             fs=recording.sample_rate_hz,
-            nperseg=min(max(64, int(round(recording.sample_rate_hz * 20))), optical_density.size),
+            nperseg=min(max(8, min(64, optical_density.size)), max(8, int(round(recording.sample_rate_hz * 20))), optical_density.size),
         )
         mask = frequencies <= min(3.0, recording.sample_rate_hz * 0.48)
         axis.semilogy(frequencies[mask], spectrum[mask], color="#457b9d", alpha=0.18, linewidth=0.7)
@@ -397,12 +611,29 @@ def _plot_spectra(recording: FNIRSRecording, destination: Path) -> None:
 
 
 def analyze_fnirs_recording(path: Path, output_directory: Path, max_seconds: float | None) -> dict[str, Any]:
+    _assert_safe_output_directory(output_directory)
+    _configure_matplotlib_font()
     print(f"读取 fNIRS {path}")
     recording = read_fnirs(path, max_seconds)
     metrics = [assess_fnirs_channel(channel, recording.sample_rate_hz) for channel in recording.channels]
     infrared_eye_tracker_interference = is_infrared_eye_tracking_task(path)
+    uncoupled_boundary = detect_fnirs_uncoupled_boundary_mask(recording)
+    sample_masks = [
+        build_fnirs_sample_masks(channel, recording.sample_rate_hz, recording.time, uncoupled_boundary)
+        for channel in recording.channels
+    ]
     output_directory.mkdir(parents=True, exist_ok=True)
     _write_metrics(metrics, output_directory / "fnirs_channel_metrics.csv")
+    np.savez_compressed(
+        output_directory / "fnirs_qc_masks.npz",
+        wavelength_valid_sample_mask=np.stack([item[0] for item in sample_masks]).astype(bool),
+        sample_valid_mask=np.stack([np.all(item[0], axis=0) for item in sample_masks]).astype(bool),
+        motion_artifact_mask=np.stack([item[1] for item in sample_masks]).astype(bool),
+        repair_mask=np.stack([item[2] for item in sample_masks]).astype(bool),
+        analysis_sample_mask=np.stack([item[3] for item in sample_masks]).astype(bool),
+        labels=np.asarray([channel.label for channel in recording.channels], dtype="U32"),
+        known_ir_interference=np.asarray(infrared_eye_tracker_interference),
+    )
     quality_title = f"fNIRS 通道质量：{path.stem}"
     if infrared_eye_tracker_interference:
         quality_title += "（已知红外眼动仪干扰）"
@@ -413,9 +644,30 @@ def analyze_fnirs_recording(path: Path, output_directory: Path, max_seconds: flo
     status_counts = {status: sum(metric.status == status for metric in metrics) for status in ("GOOD", "CAUTION", "POOR")}
     mean_score = float(np.mean([metric.quality_score for metric in metrics]))
     poor_fraction = status_counts["POOR"] / len(metrics)
-    session_status = "POOR" if poor_fraction >= 0.20 or mean_score < 55 else "CAUTION" if status_counts["POOR"] or status_counts["CAUTION"] else "GOOD"
+    quality_status_before_interference = "POOR" if poor_fraction >= 0.20 or mean_score < 55 else "CAUTION" if status_counts["POOR"] or status_counts["CAUTION"] else "GOOD"
+    session_status = quality_status_before_interference
     if infrared_eye_tracker_interference and session_status == "GOOD":
         session_status = "CAUTION"
+    repair_mask = np.stack([item[2] for item in sample_masks]).astype(bool)
+    analysis_mask = np.stack([item[3] for item in sample_masks]).astype(bool)
+    if infrared_eye_tracker_interference:
+        quality_degradation = "KNOWN_IR_INTERFERENCE_PARTIALLY_OCCLUDED"
+        analysis_branch = "EYE_IR_DEGRADED_MASKED"
+        eye_tracker_occlusion = {
+            "status": "PARTIAL_REPORTED",
+            "reported": True,
+            "mask_available": False,
+            "basis": "用户确认已做一定程度遮挡；.nirs 文件未提供逐样本物理遮挡日志。",
+        }
+    else:
+        quality_degradation = None
+        analysis_branch = "STANDARD_MASKED"
+        eye_tracker_occlusion = {
+            "status": "NOT_APPLICABLE",
+            "reported": False,
+            "mask_available": False,
+            "basis": None,
+        }
     wavelengths = sorted({metric.wavelength_a_nm for metric in metrics} | {metric.wavelength_b_nm for metric in metrics})
     companion_hcx = path.with_suffix(".hcx")
     summary = {
@@ -431,7 +683,12 @@ def analyze_fnirs_recording(path: Path, output_directory: Path, max_seconds: flo
         "wavelengths_nm": wavelengths,
         "quality_counts": status_counts,
         "mean_quality_score": round(mean_score, 2),
+        "quality_status_before_interference": quality_status_before_interference,
         "session_status": session_status,
+        "analysis_branch": analysis_branch,
+        "quality_degradation": quality_degradation,
+        "known_ir_interference": infrared_eye_tracker_interference,
+        "eye_tracker_occlusion": eye_tracker_occlusion,
         "known_interference": {
             "present": infrared_eye_tracker_interference,
             "source": "红外眼动仪发射光" if infrared_eye_tracker_interference else None,
@@ -440,6 +697,17 @@ def analyze_fnirs_recording(path: Path, output_directory: Path, max_seconds: flo
                 "通道异常不能仅归因于头发遮挡、探头耦合或运动；当前离线指标无法单独分离眼动仪红外光贡献。"
                 if infrared_eye_tracker_interference else None
             ),
+        },
+        "mask_summary": {
+            "mask_file": "fnirs_qc_masks.npz",
+            "mean_repair_sample_percent": round(float(np.mean(repair_mask) * 100.0), 3),
+            "mean_analysis_sample_percent": round(float(np.mean(analysis_mask) * 100.0), 3),
+            "channels_with_repaired_samples": int(np.count_nonzero(np.any(repair_mask, axis=1))),
+        },
+        "sensitivity_branches": {
+            "default_masked": "使用 analysis_sample_mask；原始非正/缺失样本与运动突变样本不进入默认统计。",
+            "unmasked_debug": "仅用于波形审计，不得作为生理估计。",
+            "eye_task_excluded": "可作为敏感性分析分支；不是默认数据路径。" if infrared_eye_tracker_interference else "不适用",
         },
         "thresholds": {
             "sci_band_hz": SCI_BAND_HZ,
@@ -464,6 +732,7 @@ def analyze_fnirs_recording(path: Path, output_directory: Path, max_seconds: flo
         interference_report = [
             "## 已知红外眼动仪干扰", "",
             "- 本眼动任务同步使用红外眼动仪，其发射光会干扰 fNIRS 原始光强采集。该背景由现场采集信息确认，不是程序从波形中反推的结论。",
+            "- 眼动仪遮挡状态：`PARTIAL_REPORTED`；`.nirs` 未提供逐样本物理遮挡 mask。",
             "- 因此，低 SCI、高 CV 或光密度阶跃不能仅归因于头发遮挡、探头耦合或头部运动；现有记录本身无法把眼动仪红外光贡献单独分离出来。",
             "- 通道分数保留这种实际污染的影响，不进行数值补偿。该任务的 fNIRS 结果应按已知光学混杂处理，并避免与无红外眼动仪任务直接作生理差异解释。", "",
         ]
@@ -476,6 +745,8 @@ def analyze_fnirs_recording(path: Path, output_directory: Path, max_seconds: flo
         f"- 波长：{', '.join(f'{value:.0f} nm' for value in wavelengths)}",
         f"- 平均质量分：{mean_score:.1f}/100；会话状态：`{session_status}`",
         f"- 状态统计：良好 {status_counts['GOOD']}，需关注 {status_counts['CAUTION']}，较差 {status_counts['POOR']}", "",
+        f"- 分析分支：`{analysis_branch}`；样本修复/质量门控掩码平均覆盖 {summary['mask_summary']['mean_repair_sample_percent']:.2f}%；默认可分析样本平均覆盖 {summary['mask_summary']['mean_analysis_sample_percent']:.2f}%",
+        "- `fnirs_qc_masks.npz` 保存逐通道、逐样本的双波长有效性、运动突变、修复和默认分析掩码；插值/修复样本保留在数组中但默认不进入统计。", "",
         "## 与采集方法的对应", "",
         "- 附件要求在正式采集前完成预采集和自动增益，并将红色/灰色节点调整到绿色或黄色；头发遮挡是重点排查原因。",
         "- 本程序基于正式记录的双波长原始光强离线评估，不能从未公开的 HCX 状态码可靠还原厂商界面颜色，因此不会把离线分数称为厂商节点状态。", "",

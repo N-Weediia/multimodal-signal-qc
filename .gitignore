@@ -9,6 +9,25 @@ __pycache__/
 
 # Raw recordings and generated analysis artifacts
 data/
+data_repro_*/
+outputs/
+archive/outputs/
 preprocessed_*/
 results/
 results_*/
+
+# Phase outputs and intermediate directories
+best_subject_preprocessing_comparison_20260914/
+review_20260914/
+optimized_20260914/
+mbll_relative_sensitivity_20260908/
+
+# Scratch and temporary directories
+outputs/_scratch/
+plain_tmp/
+tmp/
+mbll_test_dir/
+
+# Build artifacts and document outputs
+*.docx
+*.pdf

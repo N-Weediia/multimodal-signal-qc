@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import math
 import re
 import shutil
 import sys
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +41,7 @@ def configure_matplotlib_font() -> None:
     available = {font.name for font in font_manager.fontManager.ttflist}
     for candidate in ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC"):
         if candidate in available:
+            plt.rcParams["font.family"] = ["sans-serif"]
             plt.rcParams["font.sans-serif"] = [candidate, "DejaVu Sans"]
             break
     plt.rcParams["axes.unicode_minus"] = False
@@ -46,9 +50,44 @@ def configure_matplotlib_font() -> None:
 configure_matplotlib_font()
 
 
+def configure_summary_only() -> None:
+    """Disable diagnostic rendering while retaining all numeric QC outputs."""
+    import emg_qc
+    import fnirs_qc
+
+    def no_plot(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    globals()["plot_quality_map"] = no_plot
+    globals()["plot_preview"] = no_plot
+    globals()["plot_psd"] = no_plot
+    emg_qc._plot_quality = no_plot
+    emg_qc._plot_preview = no_plot
+    emg_qc._plot_spectra = no_plot
+    fnirs_qc._plot_quality_map = no_plot
+    fnirs_qc._plot_preview = no_plot
+    fnirs_qc._plot_spectra = no_plot
+
+
 # -------- Settings intended for local adjustment --------
-DEFAULT_DATA_ROOT = Path("data")
-DEFAULT_RESULTS_ROOT = Path("results")
+DEFAULT_DATA_ROOT = Path("data") if Path("data").is_dir() else (
+    Path("data_repro_20260903") if Path("data_repro_20260903").is_dir() else Path("data")
+)
+DEFAULT_RESULTS_ROOT = Path("outputs/qc/current")
+KNOWN_SESSIONS = ("base_line", "sec_test", "thi_test", "sec")
+IGNORED_DISCOVERY_DIRS = {"eeglab_output", "__pycache__", ".git", ".pytest_cache", ".claude", ".idea", "评估表"}
+
+
+def assert_writable_output_path(target: Path, data_root: Path | None = None) -> Path:
+    """Enforce read-only protection on J: and any configured raw data_root."""
+    resolved = target.resolve()
+    if resolved.drive.upper() == "J:" or str(resolved).startswith("\\\\?\\J:"):
+        raise PermissionError(f"严禁向只读原始数据盘 J: 写入或删除任何路径：{resolved}")
+    if data_root is not None:
+        raw_resolved = data_root.resolve()
+        if resolved == raw_resolved or resolved.is_relative_to(raw_resolved):
+            raise PermissionError(f"严禁在原始数据目录内写入或删除任何路径：{resolved}（原始目录：{raw_resolved}）")
+    return resolved
 # An empty subject means "all subject folders".  This is the safe default for
 # this project because a successful QC run should not silently omit newly
 # acquired participants.
@@ -78,7 +117,24 @@ ACTIVE_EEG_CHANNELS = (
     "Pz", "P3", "P4", "P7", "P8",
     "POz", "Oz", "O1", "O2",
 )
-EEG_CONFIGURATION_NAME = "32通道缩减方案（31个头皮导联+参考/地电极）"
+# A complete EEGCap64-V3.0 export contains 59 scalp channels plus five
+# auxiliary channels (ECG/HEOR/HEOL/VEOU/VEOL).  The reference and ground are
+# not exported as BDF signal channels.
+FULL_EEG_CHANNELS = (
+    "Fpz", "Fp1", "Fp2", "AF3", "AF4", "AF7", "AF8",
+    "Fz", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8",
+    "FCz", "FC1", "FC2", "FC3", "FC4", "FC5", "FC6", "FT7", "FT8",
+    "Cz", "C1", "C2", "C3", "C4", "C5", "C6", "T7", "T8",
+    "CP1", "CP2", "CP3", "CP4", "CP5", "CP6", "TP7", "TP8",
+    "Pz", "P3", "P4", "P5", "P6", "P7", "P8",
+    "POz", "PO3", "PO4", "PO5", "PO6", "PO7", "PO8",
+    "Oz", "O1", "O2",
+)
+SPECIAL_32_SUBJECTS = {"2026081701", "2026081801"}
+SPECIAL_32_BASELINE_FOLDER = "base_line"
+EEG_CONFIGURATION_NAME = "按记录配置"
+EEG_CONFIGURATION_32_NAME = "32通道缩减方案（31个头皮导联+参考/地电极）"
+EEG_CONFIGURATION_64_NAME = "64通道帽完整头皮方案（59个头皮导联+参考/地电极）"
 
 
 # Approximate 10-10 scalp positions. They are used only to make the quality
@@ -243,6 +299,107 @@ def load_impedances(record_information: Path | None) -> dict[str, float]:
         return {normalize_label(str(label)): float(value) for label, value in zip(labels, values)}
     except (OSError, ValueError, TypeError) as exc:
         print(f"  Warning: could not read impedance values ({exc}).", file=sys.stderr)
+        return {}
+
+
+def read_bdf_task_events(evt_path: Path | None, max_duration_seconds: float | None = None) -> dict[str, Any]:
+    """Read companion ``evt.bdf`` annotations, excluding hardware impedance checks."""
+    empty = {
+        "companion_evt_bdf": str(evt_path) if evt_path is not None and evt_path.is_file() else None,
+        "observed_event_times_seconds": [],
+        "observed_event_descriptions": [],
+        "excluded_impedance_event_count": 0,
+    }
+    if evt_path is None or not evt_path.is_file():
+        return empty
+    try:
+        header = parse_bdf_header(evt_path)
+        annotation_indices = [i for i, label in enumerate(header.labels) if "annotation" in label.lower()]
+        if not annotation_indices:
+            return empty
+        annotation_index = annotation_indices[0]
+        bytes_per_record = 3 * sum(header.samples_per_record)
+        with evt_path.open("rb") as handle:
+            handle.seek(header.header_bytes)
+            record_bytes = handle.read(header.record_count * bytes_per_record)
+        chunks: list[bytes] = []
+        offset_before = 3 * sum(header.samples_per_record[:annotation_index])
+        width = 3 * header.samples_per_record[annotation_index]
+        for record in range(header.record_count):
+            start = record * bytes_per_record + offset_before
+            chunks.append(record_bytes[start : start + width])
+        stream = b"".join(chunks).replace(b"\x00", b"")
+        matches = re.finditer(rb"\+([0-9.]+)(?:\x15[^\x14]*)?\x14([^\x14\x15]*)", stream)
+        times: list[float] = []
+        descriptions: list[str] = []
+        excluded_impedance = 0
+        for match in matches:
+            desc = match.group(2).decode("utf-8", errors="replace").strip()
+            if not desc:
+                continue
+            if "impedance" in desc.casefold():
+                excluded_impedance += 1
+                continue
+            onset = float(match.group(1))
+            if max_duration_seconds is not None and onset > max_duration_seconds + 2.0:
+                continue
+            times.append(onset)
+            descriptions.append(desc)
+        return {
+            "companion_evt_bdf": str(evt_path),
+            "observed_event_times_seconds": times,
+            "observed_event_descriptions": descriptions,
+            "excluded_impedance_event_count": excluded_impedance,
+        }
+    except (OSError, ValueError) as exc:
+        print(f"  Warning: could not parse evt.bdf ({exc}).", file=sys.stderr)
+        return empty
+
+
+def load_subject_identity_map(data_root: Path) -> dict[str, str]:
+    """Read ``编号姓名数据核对表.xlsx`` strictly in memory without holding file locks."""
+    candidates = [data_root / "编号姓名数据核对表.xlsx"]
+    if data_root.parent != data_root:
+        candidates.append(data_root.parent / "编号姓名数据核对表.xlsx")
+    xlsx_path = next((item for item in candidates if item.is_file()), None)
+    if xlsx_path is None:
+        return {}
+    try:
+        raw_bytes = xlsx_path.read_bytes()
+        ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        with zipfile.ZipFile(io.BytesIO(raw_bytes), "r") as zf:
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in zf.namelist():
+                sroot = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+                for si in sroot.findall("m:si", ns):
+                    shared.append("".join(t.text or "" for t in si.iter(f"{{{ns['m']}}}t")))
+            sheet_name = next((n for n in sorted(zf.namelist()) if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")), None)
+            if sheet_name is None:
+                return {}
+            wroot = ET.fromstring(zf.read(sheet_name))
+            identity: dict[str, str] = {}
+            for row in wroot.findall(".//m:row", ns):
+                cells: dict[str, str] = {}
+                for cell in row.findall("m:c", ns):
+                    ref = re.sub(r"\d+", "", cell.attrib.get("r", ""))
+                    ctype = cell.attrib.get("t", "")
+                    val_el = cell.find("m:v", ns)
+                    if ctype == "inlineStr":
+                        text = "".join(t.text or "" for t in cell.iter(f"{{{ns['m']}}}t"))
+                    elif val_el is None or val_el.text is None:
+                        text = ""
+                    elif ctype == "s":
+                        idx = int(val_el.text)
+                        text = shared[idx] if 0 <= idx < len(shared) else ""
+                    else:
+                        text = val_el.text
+                    cells[ref] = text.strip()
+                subject = cells.get("A", "")
+                name = cells.get("B", "")
+                if re.fullmatch(r"20\d{8}", subject) and name:
+                    identity[subject] = name
+            return identity
+    except (OSError, zipfile.BadZipFile, ET.ParseError, ValueError):
         return {}
 
 
@@ -428,12 +585,27 @@ def plot_psd(filtered: np.ndarray, labels: list[str], sample_rate: float, destin
     plt.close(fig)
 
 
-def classify_channels(labels: list[str]) -> tuple[list[int], list[int], list[int]]:
+def is_special_32_recording(recording: Path) -> bool:
+    """Return whether this is one of the two 32-gelled baseline recordings."""
+    parts = {part.casefold() for part in recording.parts}
+    return bool(parts & SPECIAL_32_SUBJECTS) and SPECIAL_32_BASELINE_FOLDER.casefold() in parts
+
+
+def eeg_configuration_for_recording(recording: Path) -> tuple[tuple[str, ...], str]:
+    """Select the scored scalp montage from the acquisition exception list."""
+    if is_special_32_recording(recording):
+        return ACTIVE_EEG_CHANNELS, EEG_CONFIGURATION_32_NAME
+    return FULL_EEG_CHANNELS, EEG_CONFIGURATION_64_NAME
+
+
+def classify_channels(
+    labels: list[str], active_channels: tuple[str, ...] = ACTIVE_EEG_CHANNELS,
+) -> tuple[list[int], list[int], list[int]]:
     """Keep disabled high-impedance electrodes out of scoring and referencing."""
     eeg_indices: list[int] = []
     auxiliary_indices: list[int] = []
     disabled_eeg_indices: list[int] = []
-    active_labels = {normalize_label(label) for label in ACTIVE_EEG_CHANNELS}
+    active_labels = {normalize_label(label) for label in active_channels}
     for index, label in enumerate(labels):
         normalized = normalize_label(label)
         if normalized in AUXILIARY_CHANNELS or label.strip().upper() == "STATUS":
@@ -445,7 +617,55 @@ def classify_channels(labels: list[str]) -> tuple[list[int], list[int], list[int
     return eeg_indices, auxiliary_indices, disabled_eeg_indices
 
 
+def clamp_eeg_disconnect_epochs(
+    raw: np.ndarray,
+    digital: np.ndarray | None,
+    digital_min: np.ndarray | None,
+    digital_max: np.ndarray | None,
+    sample_rate: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Clamp minority cap-wide connector unplugging/plugging epochs before IIR filtering.
+
+    Prevents a 300,000 uV end-of-recording unplugging step from corrupting global
+    detrending and ringing backward 15-20 s through zero-phase bandpass filters.
+    """
+    ep_len = max(1, int(round(EPOCH_SECONDS * sample_rate)))
+    n_ep = raw.shape[1] // ep_len
+    if n_ep < 3:
+        return raw.copy(), np.zeros(n_ep, dtype=bool)
+    raw_ep = raw[:, : n_ep * ep_len].reshape(raw.shape[0], n_ep, ep_len)
+    med_p2p = np.median(np.ptp(raw_ep, axis=2), axis=0)
+    if digital is not None and digital_min is not None and digital_max is not None:
+        dig_ep = digital[:, : n_ep * ep_len].reshape(digital.shape[0], n_ep, ep_len)
+        clipped_frac = np.mean(
+            np.any((dig_ep <= digital_min[:, None, None]) | (dig_ep >= digital_max[:, None, None]), axis=2),
+            axis=0,
+        )
+        disconnect = (clipped_frac >= 0.25) | (med_p2p > 2500.0)
+    else:
+        disconnect = med_p2p > 2500.0
+    if not np.any(disconnect) or np.mean(disconnect) >= 0.50:
+        return raw.copy(), np.zeros(n_ep, dtype=bool)
+    dilated = np.convolve(disconnect.astype(int), [1, 1, 1], mode="same") > 0
+    if np.mean(dilated) >= 0.60:
+        return raw.copy(), np.zeros(n_ep, dtype=bool)
+    repaired = raw.copy()
+    sample_bad = np.zeros(raw.shape[1], dtype=bool)
+    for ep_idx in np.flatnonzero(dilated):
+        sample_bad[ep_idx * ep_len : (ep_idx + 1) * ep_len] = True
+    if dilated[-1]:
+        sample_bad[n_ep * ep_len :] = True
+    good_idx = np.flatnonzero(~sample_bad)
+    bad_idx = np.flatnonzero(sample_bad)
+    if good_idx.size >= 2 and bad_idx.size:
+        for ch in range(repaired.shape[0]):
+            repaired[ch, bad_idx] = np.interp(bad_idx, good_idx, repaired[ch, good_idx])
+    return repaired, dilated
+
+
 def analyze_recording(recording: Path, output_directory: Path, max_seconds: float | None) -> dict[str, Any]:
+    assert_writable_output_path(output_directory)
+    configure_matplotlib_font()
     print(f"读取 {recording}")
     header, raw, digital = read_bdf(recording, max_seconds)
     sample_rate = header.sample_rate
@@ -454,28 +674,36 @@ def analyze_recording(recording: Path, output_directory: Path, max_seconds: floa
             f"EEG 记录仅 {raw.shape[1] / sample_rate:.3f} s，短于 {EPOCH_SECONDS:.1f} s 质量评估窗口；"
             "已在批处理清单中保留为无法判定。"
         )
-    eeg_indices, auxiliary_indices, disabled_eeg_indices = classify_channels(header.labels)
+    configured_channels, configuration_name = eeg_configuration_for_recording(recording)
+    eeg_indices, auxiliary_indices, disabled_eeg_indices = classify_channels(header.labels, configured_channels)
     present_labels = {normalize_label(header.labels[index]) for index in eeg_indices}
     missing_configured_channels = [
-        label for label in ACTIVE_EEG_CHANNELS if normalize_label(label) not in present_labels
+        label for label in configured_channels if normalize_label(label) not in present_labels
     ]
     if not eeg_indices:
         raise ValueError(
-            f"BDF中没有找到配置的32通道头皮导联；期望标签：{', '.join(ACTIVE_EEG_CHANNELS)}"
+            f"BDF中没有找到配置的头皮导联；期望标签：{', '.join(configured_channels)}"
         )
     labels = [header.labels[index] for index in eeg_indices]
     impedance_path = recording.with_name("recordInformation.json")
     impedances = load_impedances(impedance_path)
     raw_eeg = raw[eeg_indices]
+    clamped_raw_eeg, clamped_disconnect_epochs = clamp_eeg_disconnect_epochs(
+        raw_eeg,
+        digital[eeg_indices],
+        header.digital_minimums[eeg_indices],
+        header.digital_maximums[eeg_indices],
+        sample_rate,
+    )
     # A sample-wise median reference is robust to a minority of noisy or
     # disconnected electrodes (it tolerates up to half the channels being bad)
     # while still tracking the common-mode 50 Hz that appears on every channel.
     # A trimmed mean is easily contaminated once several channels are bad, which
     # then spreads their noise to every channel during re-referencing. QC-only.
-    robust_reference = np.median(raw_eeg, axis=0)
-    rereferenced_raw = raw_eeg - robust_reference
+    robust_reference = np.median(clamped_raw_eeg, axis=0)
+    rereferenced_raw = clamped_raw_eeg - robust_reference
     rereferenced_filtered = clean_for_artifact_qc(rereferenced_raw, sample_rate)
-    raw_line, _ = line_statistics(raw_eeg, sample_rate)
+    raw_line, _ = line_statistics(clamped_raw_eeg, sample_rate)
     rereferenced_line, rereferenced_high_line_epochs = line_statistics(rereferenced_raw, sample_rate)
 
     metrics = [
@@ -507,10 +735,10 @@ def analyze_recording(recording: Path, output_directory: Path, max_seconds: floa
         "duration_seconds_analyzed": round(raw.shape[1] / sample_rate, 3),
         "sample_rate_hz": sample_rate,
         "bdf_channel_count": len(header.labels),
-        "eeg_configuration": EEG_CONFIGURATION_NAME,
-        "configured_scalp_channel_count": len(ACTIVE_EEG_CHANNELS),
+        "eeg_configuration": configuration_name,
+        "configured_scalp_channel_count": len(configured_channels),
         "eeg_channel_count": len(eeg_indices),
-        "configured_scalp_channels": list(ACTIVE_EEG_CHANNELS),
+        "configured_scalp_channels": list(configured_channels),
         "missing_configured_scalp_channels": missing_configured_channels,
         "disabled_eeg_channels": [header.labels[index] for index in disabled_eeg_indices],
         "auxiliary_channels_excluded": [header.labels[index] for index in auxiliary_indices],
@@ -550,7 +778,7 @@ def analyze_recording(recording: Path, output_directory: Path, max_seconds: floa
     report = [
         f"# EEG 采集质量报告：{recording.parent.name}", "",
         f"- 数据文件：`{recording}`", f"- 实际评估时长：{summary['duration_seconds_analyzed']:.1f} s",
-        f"- 采样率：{sample_rate:.0f} Hz", f"- EEG配置：{EEG_CONFIGURATION_NAME}",
+        f"- 采样率：{sample_rate:.0f} Hz", f"- EEG配置：{configuration_name}",
         f"- 已评估启用头皮 EEG 导联：{len(eeg_indices)} 个",
         f"- 配置中未找到的头皮导联：{', '.join(missing_configured_channels) or '无'}",
         f"- 未启用的头皮 EEG 导联（不参与评分）：{', '.join(summary['disabled_eeg_channels']) or '无'}",
@@ -600,6 +828,14 @@ def recording_modality(path: Path) -> str | None:
     return None
 
 
+def _has_ignored_directory(path: Path, root: Path) -> bool:
+    try:
+        rel_parts = path.relative_to(root).parts[:-1]
+    except ValueError:
+        rel_parts = path.parts[:-1]
+    return any(part.casefold() in IGNORED_DISCOVERY_DIRS for part in rel_parts)
+
+
 def discover_recordings(data_root: Path, input_path: Path | None) -> list[Path]:
     if input_path is not None:
         if input_path.is_file():
@@ -609,7 +845,11 @@ def discover_recordings(data_root: Path, input_path: Path | None) -> list[Path]:
         search_root = input_path
     else:
         search_root = data_root
-    recordings = [path for path in search_root.rglob("*") if path.is_file() and recording_modality(path)]
+    recordings = [
+        path
+        for path in search_root.rglob("*")
+        if path.is_file() and not _has_ignored_directory(path, search_root) and recording_modality(path)
+    ]
     modality_order = {"EEG": 0, "EMG": 1, "FNIRS": 2}
     return sorted(recordings, key=lambda path: (modality_order[recording_modality(path)], str(path)))
 
@@ -622,11 +862,21 @@ TASK_LABELS = (
 
 
 def task_label_for(recording: Path) -> str:
-    """Return a stable task label without changing the source folder names."""
-    searchable = " ".join(part.casefold() for part in (*recording.parts, recording.stem))
-    for label, tokens in TASK_LABELS:
-        if any(token.casefold() in searchable for token in tokens):
-            return label
+    """Infer the task from the nearest matching parent directory only.
+
+    Exported filenames are often copied from a template or carry a stale task
+    name.  Directory placement is the authoritative task metadata; filenames
+    must not change the label.
+    """
+    # EMG files are stored once per visit under the modality directory and all
+    # belong to the movement protocol; their filenames do not encode a task.
+    if any(directory.casefold() == "emg" for directory in recording.parent.parts):
+        return "运动任务"
+    for directory in reversed(recording.parent.parts):
+        folded = directory.casefold()
+        for label, tokens in TASK_LABELS:
+            if any(token.casefold() in folded for token in tokens):
+                return label
     return "未识别任务"
 
 
@@ -662,6 +912,20 @@ def subject_for(recording: Path, data_root: Path) -> str:
         return "外部输入"
 
 
+def session_for(recording: Path, data_root: Path | None = None) -> str:
+    parts = recording.parts
+    if data_root is not None:
+        try:
+            parts = recording.relative_to(data_root).parts
+        except ValueError:
+            parts = recording.parts
+    lowered = {part.casefold(): part for part in parts}
+    for candidate in KNOWN_SESSIONS:
+        if candidate in lowered:
+            return candidate
+    return ""
+
+
 def recording_metadata(recording: Path, data_root: Path, output_directory: Path) -> dict[str, Any]:
     stat = recording.stat()
     try:
@@ -670,6 +934,7 @@ def recording_metadata(recording: Path, data_root: Path, output_directory: Path)
         relative_path = recording
     return {
         "subject": subject_for(recording, data_root),
+        "session": session_for(recording, data_root),
         "task": task_label_for(recording),
         "source_relative_path": str(relative_path),
         "source_filename": recording.name,
@@ -683,9 +948,20 @@ def write_batch_inventory(
     data_root: Path, outcomes: list[dict[str, Any]], results_root: Path,
 ) -> None:
     """Write the complete audit trail, including records that were not scored."""
-    rows = sorted(outcomes, key=lambda item: (item["subject"], item["modality"], item["task"], item["source_relative_path"]))
+    assert_writable_output_path(results_root, data_root)
+    rows = sorted(
+        outcomes,
+        key=lambda item: (
+            item["subject"],
+            item.get("session", ""),
+            item["modality"],
+            item["task"],
+            item["source_relative_path"],
+        ),
+    )
     fields = [
-        "subject", "task", "modality", "status", "session_status", "mean_quality_score",
+        "subject", "session", "task", "modality", "status", "session_status", "mean_quality_score",
+        "known_ir_interference", "eye_tracker_occlusion_status", "analysis_branch", "quality_degradation",
         "source_relative_path", "source_filename", "source_size_bytes", "source_modified_at",
         "result_directory", "message",
     ]
@@ -694,7 +970,11 @@ def write_batch_inventory(
         writer.writeheader()
         writer.writerows(rows)
 
-    subjects = sorted(path.name for path in data_root.iterdir() if path.is_dir()) if data_root.exists() else []
+    subjects = (
+        sorted(path.name for path in data_root.iterdir() if path.is_dir() and path.name.casefold() not in IGNORED_DISCOVERY_DIRS)
+        if data_root.exists()
+        else []
+    )
     by_subject: dict[str, dict[str, Any]] = {}
     for subject in subjects:
         subject_rows = [row for row in rows if row["subject"] == subject]
@@ -757,9 +1037,16 @@ def main() -> int:
     parser.add_argument("--results-root", type=Path, default=DEFAULT_RESULTS_ROOT, help="报告和图片的输出根目录。")
     parser.add_argument("--max-seconds", type=float, help="每个文件仅评估前 N 秒，用于快速检查。")
     parser.add_argument("--overwrite", action="store_true", help="覆盖已有的对应结果目录。")
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="计算完整数值质控，但不生成逐记录诊断图片。",
+    )
     args = parser.parse_args()
     if args.max_seconds is not None and args.max_seconds <= 0:
         parser.error("--max-seconds must be positive.")
+    if args.summary_only:
+        configure_summary_only()
     selected_input = args.input
     if selected_input is None and args.subject:
         selected_input = args.data_root / args.subject
@@ -767,12 +1054,14 @@ def main() -> int:
     if not recordings:
         print(f"在 {selected_input or args.data_root} 下未找到支持的 EEG、sEMG 或 fNIRS 记录。", file=sys.stderr)
         return 2
+    assert_writable_output_path(args.results_root, args.data_root)
     outcomes: list[dict[str, Any]] = []
     for recording in recordings:
         modality = recording_modality(recording)
         if modality is None:
             continue
         destination = output_path_for(recording, args.data_root, args.results_root)
+        assert_writable_output_path(destination, args.data_root)
         metadata = recording_metadata(recording, args.data_root, destination)
         common_outcome = {"modality": modality, **metadata}
         if destination.exists() and args.overwrite:
@@ -803,6 +1092,10 @@ def main() -> int:
                 "status": "SUCCESS",
                 "session_status": summary.get("session_status"),
                 "mean_quality_score": summary.get("mean_quality_score"),
+                "known_ir_interference": summary.get("known_ir_interference"),
+                "eye_tracker_occlusion_status": summary.get("eye_tracker_occlusion", {}).get("status"),
+                "analysis_branch": summary.get("analysis_branch"),
+                "quality_degradation": summary.get("quality_degradation"),
                 "message": "",
             })
         except Exception as exc:  # Keep later recordings analyzable if one export is corrupt.

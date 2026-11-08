@@ -15,14 +15,39 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import numpy as np
 from scipy import integrate, signal
+
+
+def _configure_matplotlib_font() -> None:
+    available = {font.name for font in font_manager.fontManager.ttflist}
+    for candidate in ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC"):
+        if candidate in available:
+            plt.rcParams["font.family"] = ["sans-serif"]
+            plt.rcParams["font.sans-serif"] = [candidate, "DejaVu Sans"]
+            break
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+_configure_matplotlib_font()
+
+
+def _assert_safe_output_directory(destination: Path) -> None:
+    resolved = destination.resolve()
+    if resolved.drive.upper() == "J:" or str(resolved).startswith("\\\\?\\J:"):
+        raise PermissionError(f"严禁向只读原始数据盘 J: 写入任何文件：{resolved}")
 
 
 LINE_FREQUENCY_HZ = 50.0
 EMG_BAND_HZ = (20.0, 450.0)
 EMG_EPOCH_SECONDS = 1.0
-SENSOR_MUSCLES = {
+EMG_WINDOW_MIN_WEIGHT = 0.25
+
+# The user-confirmed acquisition table is authoritative for the current
+# dataset. It contains seven physical Avanti sensors; the gaps 6--8 are not
+# missing logical channels and must not trigger any channel renumbering.
+ACTUAL_SENSOR_MUSCLES = {
     2: "斜方肌（上部）",
     3: "三角肌前束",
     4: "三角肌中束",
@@ -31,6 +56,43 @@ SENSOR_MUSCLES = {
     10: "肱桡肌",
     11: "尺侧腕屈肌",
 }
+EXPECTED_SENSOR_IDS = tuple(ACTUAL_SENSOR_MUSCLES)
+MAPPING_PROFILE_STANDARD = "standard_v1"
+MAPPING_PROFILE_SHIFTED_2026080901 = "shifted_v1_2026080901_base_line"
+MAPPING_PROFILE_UNRESOLVED = "unresolved_v1"
+
+# One exported recording has the same seven physical channels in a shifted
+# numbering scheme.  This is deliberately keyed to the exact subject/session
+# context supplied by the user; a seven-channel file elsewhere is not
+# silently reinterpreted as a valid alternate mapping.
+SHIFTED_RECORD_KEYS = {("2026080901", "base_line")}
+SHIFTED_SENSOR_IDS = (1, 2, 3, 4, 5, 9, 10)
+SHIFTED_SENSOR_MUSCLES = {
+    physical_id: ACTUAL_SENSOR_MUSCLES[canonical_id]
+    for physical_id, canonical_id in zip(SHIFTED_SENSOR_IDS, EXPECTED_SENSOR_IDS)
+}
+# Logical index follows the order in the confirmed table, not the numeric
+# value of the physical sensor ID (sensor 9 is logical muscle 5).
+SENSOR_TO_MUSCLE_INDEX = {
+    sensor_id: index for index, sensor_id in enumerate(EXPECTED_SENSOR_IDS, start=1)
+}
+SENSOR_MUSCLES = dict(ACTUAL_SENSOR_MUSCLES)
+# Compatibility name retained for older reports; new reports also expose the
+# explicit actual_sensor_muscles field below.
+LEGACY_SENSOR_MUSCLES = dict(ACTUAL_SENSOR_MUSCLES)
+
+
+def muscle_index_for_sensor(sensor_id: int) -> int | None:
+    """Return the table-order logical muscle index for a physical sensor."""
+    return SENSOR_TO_MUSCLE_INDEX.get(int(sensor_id))
+
+
+def muscle_label_for_sensor(sensor_id: int) -> str:
+    """Return an anatomical/placeholder label without renumbering channels."""
+    sensor_id = int(sensor_id)
+    if sensor_id in SENSOR_MUSCLES:
+        return SENSOR_MUSCLES[sensor_id]
+    return f"unconfigured_sensor_{sensor_id}"
 
 
 @dataclass
@@ -41,6 +103,13 @@ class EMGSeries:
     time: np.ndarray
     values: np.ndarray
     sample_rate_hz: float
+    muscle_index: int | None = None
+    canonical_sensor_id: int | None = None
+    mapping_profile_id: str = MAPPING_PROFILE_UNRESOLVED
+    mapping_status: str = "unresolved"
+    mapping_confidence: str = "低"
+    mapping_basis: str = ""
+    mapping_valid_for_primary_features: bool = False
 
 
 @dataclass
@@ -64,6 +133,105 @@ class EMGChannelMetrics:
     quality_score: float
     status: str
     reasons: str
+    muscle_index: int | None = None
+    canonical_sensor_id: int | None = None
+    mapping_profile_id: str = MAPPING_PROFILE_UNRESOLVED
+    mapping_status: str = "unresolved"
+    mapping_confidence: str = "低"
+    mapping_valid_for_primary_features: bool = False
+
+
+def _record_key(path: Path | None) -> tuple[str, str] | None:
+    """Extract the subject/session pair without relying on the filename."""
+    if path is None:
+        return None
+    parts = [part.lower() for part in Path(path).parts]
+    session = next((value for value in ("base_line", "sec_test", "thi_test", "sec") if value in parts), None)
+    subject = next((part for part in parts if re.fullmatch(r"20\d{8}", part)), None)
+    return (subject, session) if subject and session else None
+
+
+def resolve_emg_mapping(sensor_ids: list[int] | tuple[int, ...] | set[int], recording: Path | None = None) -> dict[str, Any]:
+    """Resolve physical sensor IDs to stable logical muscle indices.
+
+    Standard records retain the confirmed physical IDs.  The one explicitly
+    confirmed shifted export is mapped by logical order, while any other
+    shifted-looking file remains unresolved and is excluded from primary
+    muscle features until reviewed.
+    """
+    raw_ids = [int(value) for value in sensor_ids]
+    observed = tuple(sorted(set(raw_ids)))
+    duplicate_ids = len(raw_ids) != len(set(raw_ids))
+    canonical = tuple(sorted(EXPECTED_SENSOR_IDS))
+    record_key = _record_key(recording)
+    if duplicate_ids:
+        profile_id = MAPPING_PROFILE_UNRESOLVED
+        status = "unresolved"
+        confidence = "低"
+        basis = "EMG 表头包含重复物理 sensor ID，无法建立一一映射"
+        physical_to_logical = {}
+        physical_to_canonical = {}
+        labels = {}
+        valid = False
+        expected = canonical
+    elif observed == canonical:
+        profile_id = MAPPING_PROFILE_STANDARD
+        status = "standard"
+        confidence = "高"
+        basis = "用户确认的标准物理 sensor 映射表"
+        physical_to_logical = {sensor_id: SENSOR_TO_MUSCLE_INDEX[sensor_id] for sensor_id in observed}
+        physical_to_canonical = {sensor_id: sensor_id for sensor_id in observed}
+        labels = {sensor_id: SENSOR_MUSCLES[sensor_id] for sensor_id in observed}
+        valid = True
+        expected = canonical
+    elif observed == tuple(sorted(SHIFTED_SENSOR_IDS)) and record_key in SHIFTED_RECORD_KEYS:
+        profile_id = MAPPING_PROFILE_SHIFTED_2026080901
+        status = "record_override"
+        confidence = "高"
+        basis = "用户确认 2026080901/base_line 为整组前移一位；按观测通道顺序对应七块目标肌肉"
+        physical_to_logical = {sensor_id: index for index, sensor_id in enumerate(SHIFTED_SENSOR_IDS, start=1)}
+        physical_to_canonical = {sensor_id: EXPECTED_SENSOR_IDS[index - 1] for sensor_id, index in physical_to_logical.items()}
+        labels = {sensor_id: SHIFTED_SENSOR_MUSCLES[sensor_id] for sensor_id in observed}
+        valid = True
+        expected = tuple(sorted(SHIFTED_SENSOR_IDS))
+    else:
+        profile_id = MAPPING_PROFILE_STANDARD if set(observed).issubset(set(EXPECTED_SENSOR_IDS)) else MAPPING_PROFILE_UNRESOLVED
+        status = "standard_partial" if profile_id == MAPPING_PROFILE_STANDARD else "unresolved"
+        confidence = "中" if profile_id == MAPPING_PROFILE_STANDARD else "低"
+        basis = "观测通道属于标准表的子集；未发生自动重排" if profile_id == MAPPING_PROFILE_STANDARD else "观测通道与已确认映射不一致，等待记录级核对"
+        physical_to_logical = {sensor_id: SENSOR_TO_MUSCLE_INDEX[sensor_id] for sensor_id in observed if sensor_id in SENSOR_TO_MUSCLE_INDEX}
+        physical_to_canonical = {sensor_id: sensor_id for sensor_id in physical_to_logical}
+        labels = {sensor_id: SENSOR_MUSCLES[sensor_id] for sensor_id in physical_to_logical}
+        valid = profile_id == MAPPING_PROFILE_STANDARD
+        expected = canonical
+    missing = sorted(set(expected) - set(observed))
+    unexpected = sorted(set(observed) - set(expected))
+    canonical_missing = sorted(set(canonical) - set(observed))
+    canonical_unexpected = sorted(set(observed) - set(canonical))
+    return {
+        "mapping_profile_id": profile_id,
+        "mapping_status": status,
+        "mapping_confidence": confidence,
+        "mapping_basis": basis,
+        "mapping_source": (
+            "user_confirmed_record_override"
+            if status == "record_override"
+            else "record_review_required"
+            if status == "unresolved"
+            else "confirmed_sensor_table"
+        ),
+        "mapping_valid_for_primary_features": valid,
+        "physical_sensor_ids": list(observed),
+        "mapping_expected_sensor_ids": list(expected),
+        "mapping_missing_sensor_ids": missing,
+        "mapping_unexpected_sensor_ids": unexpected,
+        "canonical_expected_sensor_ids": list(canonical),
+        "canonical_missing_sensor_ids": canonical_missing,
+        "canonical_unexpected_sensor_ids": canonical_unexpected,
+        "physical_to_logical": {str(key): value for key, value in sorted(physical_to_logical.items())},
+        "physical_to_canonical": {str(key): value for key, value in sorted(physical_to_canonical.items())},
+        "logical_labels": {str(key): labels[key] for key in sorted(labels)},
+    }
 
 
 def _sensor_columns(header: list[str]) -> list[tuple[int, int, int, str]]:
@@ -109,6 +277,7 @@ def read_emg_csv(path: Path, max_seconds: float | None) -> list[EMGSeries]:
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         header = next(csv.reader(handle))
     columns = _sensor_columns(header)
+    mapping = resolve_emg_mapping([sensor_id for sensor_id, *_ in columns], path)
     usecols = [column for _, time_index, signal_index, _ in columns for column in (time_index, signal_index)]
     raw = np.genfromtxt(
         path,
@@ -145,10 +314,17 @@ def read_emg_csv(path: Path, max_seconds: float | None) -> list[EMGSeries]:
             EMGSeries(
                 sensor_id=sensor_id,
                 label=label,
-                muscle=SENSOR_MUSCLES.get(sensor_id, "未在校正采集映射中定义"),
+                muscle=mapping["logical_labels"].get(str(sensor_id), muscle_label_for_sensor(sensor_id)),
                 time=time,
                 values=values,
                 sample_rate_hz=sample_rate,
+                muscle_index=mapping["physical_to_logical"].get(str(sensor_id)),
+                canonical_sensor_id=mapping["physical_to_canonical"].get(str(sensor_id)),
+                mapping_profile_id=mapping["mapping_profile_id"],
+                mapping_status=mapping["mapping_status"],
+                mapping_confidence=mapping["mapping_confidence"],
+                mapping_basis=mapping["mapping_basis"],
+                mapping_valid_for_primary_features=mapping["mapping_valid_for_primary_features"],
             )
         )
     return series
@@ -179,7 +355,15 @@ def assess_emg_channel(series: EMGSeries) -> EMGChannelMetrics:
     zero_percent = float(np.mean(values == 0) * 100.0)
     minimum = float(np.min(values))
     maximum = float(np.max(values))
-    repeated_extreme = float(max(np.mean(values == minimum), np.mean(values == maximum)) * 100.0)
+    repeated_extreme = (
+        100.0
+        / max(1, values.size)
+        * max(
+            0,
+            int(np.count_nonzero(values == minimum)) - 1,
+            int(np.count_nonzero(values == maximum)) - 1,
+        )
+    )
 
     epoch_samples = max(2, int(round(EMG_EPOCH_SECONDS * series.sample_rate_hz)))
     epoch_count = values.size // epoch_samples
@@ -213,6 +397,9 @@ def assess_emg_channel(series: EMGSeries) -> EMGChannelMetrics:
     elif missing_percent >= 0.5:
         score -= 20
         reasons.append(f"估计丢样 {missing_percent:.2f}%")
+    elif np.isfinite(maximum_gap_ms) and maximum_gap_ms >= 500.0:
+        score -= 15
+        reasons.append(f"存在最大采样间隔跳变 {maximum_gap_ms:.1f} ms")
     if flat_percent >= 10.0 or robust_std == 0:
         score -= 50
         reasons.append(f"平线分段 {flat_percent:.1f}%")
@@ -225,7 +412,10 @@ def assess_emg_channel(series: EMGSeries) -> EMGChannelMetrics:
     elif repeated_extreme >= 0.1:
         score -= 15
         reasons.append(f"重复极值采样 {repeated_extreme:.2f}%")
-    if line_percent >= 20.0:
+    if line_percent >= 85.0:
+        score -= 50
+        reasons.append(f"50 Hz 及谐波主导功率占比极高 {line_percent:.1f}%（疑似电极悬空/脱落）")
+    elif line_percent >= 20.0:
         score -= 30
         reasons.append(f"50 Hz 及谐波功率占 EMG 频带 {line_percent:.1f}%")
     elif line_percent >= 5.0:
@@ -256,7 +446,139 @@ def assess_emg_channel(series: EMGSeries) -> EMGChannelMetrics:
         quality_score=score,
         status=status,
         reasons="；".join(reasons) if reasons else "未超过质量阈值",
+        muscle_index=series.muscle_index,
+        canonical_sensor_id=series.canonical_sensor_id,
+        mapping_profile_id=series.mapping_profile_id,
+        mapping_status=series.mapping_status,
+        mapping_confidence=series.mapping_confidence,
+        mapping_valid_for_primary_features=series.mapping_valid_for_primary_features,
     )
+
+
+def _window_line_dominance_ratio(chunk: np.ndarray, sample_rate_hz: float) -> float:
+    """Estimate 50 Hz + harmonic narrowband power fraction in one window."""
+    if chunk.size < 64 or sample_rate_hz < 120.0:
+        return 0.0
+    centered = signal.detrend(chunk, type="linear")
+    upper = min(EMG_BAND_HZ[1], sample_rate_hz * 0.45)
+    if upper <= EMG_BAND_HZ[0]:
+        return 0.0
+    frequencies, spectrum = signal.welch(centered, fs=sample_rate_hz, nperseg=min(chunk.size, max(64, int(round(sample_rate_hz)))))
+    broadband = _band_power(frequencies, spectrum, EMG_BAND_HZ[0], upper)
+    if broadband <= np.finfo(float).tiny:
+        return 0.0
+    line_power = 0.0
+    harmonic = LINE_FREQUENCY_HZ
+    while harmonic <= upper:
+        line_power += _band_power(frequencies, spectrum, harmonic - 1.5, harmonic + 1.5)
+        harmonic += LINE_FREQUENCY_HZ
+    return float(np.clip(line_power / broadband, 0.0, 1.0))
+
+
+def emg_window_quality(
+    values: np.ndarray,
+    sample_rate_hz: float,
+    channel_score: float = 100.0,
+    window_seconds: float = EMG_EPOCH_SECONDS,
+    *,
+    raw_values: np.ndarray | None = None,
+    valid_sample_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a contraction-preserving per-window validity mask and soft weight.
+
+    Unlike resting-state signals, movement-protocol sEMG is ~75% rest and ~25%
+    voluntary contraction bursts.  Anchoring excursion thresholds on the active
+    95th-percentile window RMS preserves genuine multiphasic muscle contractions
+    while rejecting dropouts, flatlines, rail clipping, impulsive cable pops,
+    and partial-session electrode detachment dominated by 50 Hz harmonics.
+    """
+    values = np.asarray(values, dtype=float).reshape(-1)
+    raw_flat = np.asarray(raw_values, dtype=float).reshape(-1) if raw_values is not None else None
+    sample_ok = (
+        np.asarray(valid_sample_mask, dtype=bool).reshape(-1)
+        if valid_sample_mask is not None
+        else np.isfinite(values)
+    )
+    size = max(1, int(round(float(sample_rate_hz) * window_seconds)))
+    count = int(np.ceil(values.size / size)) if values.size else 0
+    mask = np.zeros(count, dtype=bool)
+    weights = np.zeros(count, dtype=np.float32)
+    finite = values[np.isfinite(values) & sample_ok[: values.size]]
+    if finite.size == 0:
+        return mask, weights
+    center = float(np.median(finite))
+    scale = float(1.4826 * np.median(np.abs(finite - center)))
+    if not np.isfinite(scale) or scale <= np.finfo(float).eps:
+        scale = float(np.std(finite))
+    scale = max(scale, np.finfo(float).eps)
+    base = float(np.clip(channel_score, 0.0, 100.0) / 100.0)
+
+    window_rms_values: list[float] = []
+    for index in range(count):
+        chunk = values[index * size : (index + 1) * size]
+        ok_chunk = sample_ok[index * size : index * size + chunk.size] & np.isfinite(chunk)
+        if int(np.count_nonzero(ok_chunk)) >= max(3, int(0.8 * chunk.size)):
+            valid_vals = chunk[ok_chunk]
+            window_rms_values.append(float(np.sqrt(np.mean((valid_vals - np.median(valid_vals)) ** 2))))
+    active_ref = (
+        max(float(np.percentile(window_rms_values, 95)), scale * 8.0, np.finfo(float).eps)
+        if window_rms_values
+        else max(scale * 8.0, np.finfo(float).eps)
+    )
+
+    for index in range(count):
+        start = index * size
+        stop = min(values.size, (index + 1) * size)
+        chunk = values[start:stop]
+        ok_chunk = sample_ok[start:stop] & np.isfinite(chunk)
+        if int(np.count_nonzero(ok_chunk)) < max(3, int(0.8 * chunk.size)):
+            continue
+        finite_chunk = chunk[ok_chunk]
+        chunk_center = float(np.median(finite_chunk))
+        chunk_scale = float(1.4826 * np.median(np.abs(finite_chunk - chunk_center)))
+        chunk_rms = float(np.sqrt(np.mean((finite_chunk - chunk_center) ** 2)))
+        flat = chunk_scale <= max(np.finfo(float).eps, scale * 1e-4) and chunk_rms <= max(np.finfo(float).eps, scale * 1e-4)
+
+        repeated_extreme_ratio = 0.0
+        if finite_chunk.size >= 20:
+            cmin = float(np.min(finite_chunk))
+            cmax = float(np.max(finite_chunk))
+            repeated_extreme_ratio = max(
+                0,
+                int(np.count_nonzero(finite_chunk == cmin)) - 1,
+                int(np.count_nonzero(finite_chunk == cmax)) - 1,
+            ) / float(finite_chunk.size)
+        if repeated_extreme_ratio >= 0.02:
+            continue
+
+        # Detect impulsive cable/electrode pop glitches via crest factor + step jump.
+        crest = float(np.max(np.abs(finite_chunk - chunk_center)) / max(chunk_rms, np.finfo(float).eps))
+        step_jump = float(np.max(np.abs(np.diff(finite_chunk))) / max(chunk_rms, np.finfo(float).eps)) if finite_chunk.size >= 4 else 0.0
+        glitch_penalty = 1.0
+        if crest > 14.0 and step_jump > 10.0:
+            glitch_penalty = float(np.exp(-0.35 * (crest - 14.0)))
+
+        # Detect partial-session electrode detachment dominated by raw 50 Hz sine waves.
+        detachment_penalty = 1.0
+        if raw_flat is not None and raw_flat.size >= stop:
+            raw_chunk = raw_flat[start:stop][ok_chunk]
+            if raw_chunk.size >= 64:
+                raw_rms = float(np.sqrt(np.mean((raw_chunk - np.median(raw_chunk)) ** 2)))
+                line_ratio = _window_line_dominance_ratio(raw_chunk, sample_rate_hz)
+                if line_ratio >= 0.85 and chunk_rms < 0.30 * max(raw_rms, np.finfo(float).eps):
+                    if line_ratio >= 0.92:
+                        continue
+                    detachment_penalty = float(np.clip(1.0 - (line_ratio - 0.80) / 0.15, 0.1, 1.0))
+
+        # Preserve physiological contractions (up to 3x active P95 RMS at full weight),
+        # only down-weighting runaway saturation bursts far above active contractions.
+        active_ratio = chunk_rms / active_ref
+        excursion = max(0.0, active_ratio - 3.0)
+        local = float(np.exp(-0.35 * excursion)) * glitch_penalty * detachment_penalty
+        weight = float(np.clip(base * local, 0.0, 1.0))
+        weights[index] = weight
+        mask[index] = bool(not flat and weight >= EMG_WINDOW_MIN_WEIGHT)
+    return mask, weights
 
 
 def _write_metrics(metrics: list[EMGChannelMetrics], destination: Path) -> None:
@@ -329,6 +651,8 @@ def _plot_quality(metrics: list[EMGChannelMetrics], destination: Path) -> None:
 
 
 def analyze_emg_recording(recording: Path, output_directory: Path, max_seconds: float | None) -> dict[str, Any]:
+    _assert_safe_output_directory(output_directory)
+    _configure_matplotlib_font()
     print(f"读取 sEMG {recording}")
     series = read_emg_csv(recording, max_seconds)
     metrics = [assess_emg_channel(item) for item in series]
@@ -339,9 +663,9 @@ def analyze_emg_recording(recording: Path, output_directory: Path, max_seconds: 
     _plot_spectra(series, output_directory / "power_spectra.png")
 
     actual_sensors = {item.sensor_id for item in series}
-    configured_sensors = set(SENSOR_MUSCLES)
-    missing_sensors = sorted(configured_sensors - actual_sensors)
-    unconfigured_sensors = sorted(actual_sensors - configured_sensors)
+    mapping = resolve_emg_mapping(sorted(actual_sensors), recording)
+    missing_sensors = mapping["mapping_missing_sensor_ids"]
+    unconfigured_sensors = mapping["mapping_unexpected_sensor_ids"]
     status_counts = {status: sum(metric.status == status for metric in metrics) for status in ("GOOD", "CAUTION", "POOR")}
     mean_score = float(np.mean([metric.quality_score for metric in metrics]))
     session_status = "POOR" if status_counts["POOR"] else "CAUTION" if status_counts["CAUTION"] else "GOOD"
@@ -354,9 +678,30 @@ def analyze_emg_recording(recording: Path, output_directory: Path, max_seconds: 
         "duration_seconds_analyzed": round(max(metric.duration_seconds for metric in metrics), 3),
         "sensor_count": len(metrics),
         "sensor_ids": sorted(actual_sensors),
-        "configured_sensor_ids": sorted(configured_sensors),
-        "sensor_muscle_mapping": {str(sensor_id): SENSOR_MUSCLES[sensor_id] for sensor_id in sorted(configured_sensors)},
-        "mapping_basis": "现场校正：以实际单元序列 2、3、4、5、9、10、11 依次对应七块目标肌肉",
+        "configured_sensor_ids": sorted(EXPECTED_SENSOR_IDS),
+        "sensor_muscle_mapping": {
+            str(sensor_id): {
+                "muscle_index": mapping["physical_to_logical"].get(str(sensor_id)),
+                "canonical_sensor_id": mapping["physical_to_canonical"].get(str(sensor_id)),
+                "label": mapping["logical_labels"].get(str(sensor_id), muscle_label_for_sensor(sensor_id)),
+                "label_role": "user_confirmed_record_mapping" if mapping["mapping_status"] == "record_override" else "user_confirmed_actual_mapping",
+            }
+            for sensor_id in sorted(actual_sensors)
+        },
+        "actual_sensor_muscles": {str(sensor_id): label for sensor_id, label in sorted(ACTUAL_SENSOR_MUSCLES.items())},
+        "legacy_sensor_muscles": {str(sensor_id): label for sensor_id, label in sorted(LEGACY_SENSOR_MUSCLES.items())},
+        "expected_sensor_ids": mapping["mapping_expected_sensor_ids"],
+        "mapping_profile_id": mapping["mapping_profile_id"],
+        "mapping_status": mapping["mapping_status"],
+        "mapping_confidence": mapping["mapping_confidence"],
+        "mapping_basis": mapping["mapping_basis"],
+        "mapping_source": mapping["mapping_source"],
+        "mapping_valid_for_primary_features": mapping["mapping_valid_for_primary_features"],
+        "physical_to_logical": mapping["physical_to_logical"],
+        "physical_to_canonical": mapping["physical_to_canonical"],
+        "canonical_expected_sensor_ids": mapping["canonical_expected_sensor_ids"],
+        "canonical_missing_sensor_ids": mapping["canonical_missing_sensor_ids"],
+        "canonical_unexpected_sensor_ids": mapping["canonical_unexpected_sensor_ids"],
         "missing_configured_sensor_ids": missing_sensors,
         "unconfigured_sensor_ids": unconfigured_sensors,
         "source_amplitude_unit": "CSV 未声明；保留源数值单位",
@@ -385,8 +730,10 @@ def analyze_emg_recording(recording: Path, output_directory: Path, max_seconds: 
         f"- 平均质量分：{mean_score:.1f}/100；会话状态：`{session_status}`",
         f"- 状态统计：良好 {status_counts['GOOD']}，需关注 {status_counts['CAUTION']}，较差 {status_counts['POOR']}", "",
         "## 校正后的肌肉映射", "",
-        "- 根据现场校正，附件中的七块目标肌肉整体后移到实际采集单元序列 2、3、4、5、9、10、11。",
-        "- 对应关系：2 号斜方肌（上部），3 号三角肌前束，4 号三角肌中束，5 号肱二头肌，9 号肱三头肌，10 号肱桡肌，11 号尺侧腕屈肌。",
+        f"- 映射配置：`{mapping['mapping_profile_id']}`；状态：`{mapping['mapping_status']}`；置信度：{mapping['mapping_confidence']}。",
+        f"- 映射依据：{mapping['mapping_basis']}。",
+        "- 主特征按逻辑肌肉索引 1--7 对齐；原始物理 sensor ID 仅用于追溯。",
+        "- 标准映射为物理 sensor 2、3、4、5、9、10、11；该记录的前移映射为观测 sensor 1、2、3、4、5、9、10。",
         f"- 缺少校正映射中的传感器：{', '.join(map(str, missing_sensors)) or '无'}。",
         f"- 未在校正映射中定义的传感器：{', '.join(map(str, unconfigured_sensors)) or '无'}。", "",
         "## 离线质量规则", "",
