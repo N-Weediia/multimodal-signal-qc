@@ -4,25 +4,55 @@
 
 ---
 
-## 1. 根目录核心模块职责分工
+## 1. 架构升级与代码模块化分层 (`src/`)
 
-| 文件/目录 | 职责定位 | 核心输入/依赖 | 关键输出/作用 |
-| :--- | :--- | :--- | :--- |
-| [`main.py`](file:///d:/Python_File/EEF_analyze/main.py) | 多模态离线质量评估 (QC) 主入口 | 原始 BDF, CSV, NIRS | `outputs/qc/current/` (报告、诊断图、inventory) |
-| [`preprocess.py`](file:///d:/Python_File/EEF_analyze/preprocess.py) | 规范化去噪预处理与掩码提取入口 | 原始数据 | `outputs/preprocessed/` (`*_cleaned.npz`, index.json) |
-| [`emg_qc.py`](file:///d:/Python_File/EEF_analyze/emg_qc.py) | 表面肌电与 IMU 质量评估底层算法库 | Delsys CSV 时序 | 肌肉映射对齐、工频谐波比、倾角代理 |
-| [`fnirs_qc.py`](file:///d:/Python_File/EEF_analyze/fnirs_qc.py) | 近红外脑血氧质量评估底层算法库 | Homer `.nirs` | 双波长匹配、SCI、CV、红外干扰识别 |
-| [`low_snr_recovery.py`](file:///d:/Python_File/EEF_analyze/low_snr_recovery.py) | 低信噪比信号实验性恢复探索 | 原始记录 | Hampel/TDDR 阶跃修正、谐波回归分支 |
-| [`expand_all_cases.py`](file:///d:/Python_File/EEF_analyze/expand_all_cases.py) | 全量病例特征展开与提取 | 原始数据 + QC Inventory | 受试者级动作 Block 特征表 |
-| [`summarize_expanded_results.py`](file:///d:/Python_File/EEF_analyze/summarize_expanded_results.py) | 特征表多任务汇总与配对统计 | 展开特征表 | 任务响应均值、质控合格率 |
-| [`quality_gated_phenotype.py`](file:///d:/Python_File/EEF_analyze/quality_gated_phenotype.py) | 质量门控表型构建与综合矩阵 | 展开特征 + QC 评分 | 降维表型、清洗后特征矩阵 |
-| [`integrate_tcm_reports.py`](file:///d:/Python_File/EEF_analyze/integrate_tcm_reports.py) | 中医四诊与眼动仪量化报告整合 | 报告文件 (PDF/XLSX) | 多源表型关联清单 |
-| [`mbll_relative_sensitivity_reviewed_20260908.py`](file:///d:/Python_File/EEF_analyze/mbll_relative_sensitivity_reviewed_20260908.py) | 相对 MBLL 敏感性分析脚本 | 原始数据 + 预处理 OD | HbO/HbR 敏感性网格评估 |
-| [`plot_eeg_montage.py`](file:///d:/Python_File/EEF_analyze/plot_eeg_montage.py) | 64导 EEG 国际 10-10 拓扑排布绘图 | 电极物理坐标与 ROI 分区 | 矢量与高清脑电排布图 |
-| [`plot_eeg_montage_hires.py`](file:///d:/Python_File/EEF_analyze/plot_eeg_montage_hires.py) | 高分印刷排版脑电图生成 | 同上 | 300 DPI 印刷级图版 |
-| [`build_best_subject_preprocessing_comparison_20260914.py`](file:///d:/Python_File/EEF_analyze/build_best_subject_preprocessing_comparison_20260914.py) | 最佳受试者预处理效果展示生成器 | `review_20260914` 产物 | 6 组对比图版与指标对比表 |
-| [`build_preprocess_steps_and_figure_guide_20260914.py`](file:///d:/Python_File/EEF_analyze/build_preprocess_steps_and_figure_guide_20260914.py) | 预处理技术指南 Word 构建脚本 | 最佳受试者对比图 | Word 格式技术图解指南 |
-| [`build_document_and_pdf.py`](file:///d:/Python_File/EEF_analyze/build_document_and_pdf.py) | 实验方案与多模态规格整合排版 | 方案文本、图表资产 | 方案 Word 修订版与无头渲染 PDF |
+自系统版本 `v8.0.0` 起，项目全面实行**模态与阶段正交分离**的模块化架构，核心底层算法与执行流水线统一归整于 `src/` 目录下，根目录保留经典无破坏门面（Facade）：
+
+```text
+src/
+├── modalities/                 # 【按模态划分：物理与生理信号处理算法】
+│   ├── eeg/                    # 脑电模态 (qc.py, preprocess.py, features.py, montage.py, montage_hires.py)
+│   ├── emg/                    # 表面肌电模态 (qc.py, preprocess.py, imu.py, mapping.py)
+│   ├── fnirs/                  # 近红外模态 (qc.py, preprocess.py, mbll.py, mbll_v1.py)
+│   └── multimodal/             # 跨模态整合 (alignment.py, cmc.py, cross_network.py, tcm_eye.py)
+│
+├── stages/                     # 【按业务阶段划分：全流程执行流水线】
+│   ├── stage0_audit_sync/      # Stage 0: 原始数据只读审计、哈希校验与受控拉取
+│   ├── stage1_qc/              # Stage 1: 多模态独立离线质量筛查 (pipeline.py)
+│   ├── stage2_preprocess/      # Stage 2: 规范预处理与清洗导出 (pipeline.py)
+│   ├── stage3_recovery/        # Stage 3: 低信噪比与伪迹分级恢复 (low_snr_recovery.py, subspace_shrinkage.py)
+│   ├── stage4_features/        # Stage 4: 全量病例特征展开与表型整合 (expand_cases, summarize, phenotype)
+│   ├── stage5_analysis/        # Stage 5: 专项分析分支 (mbll_sensitivity, multimodal_graph, exploratory_phases)
+│   └── stage6_reporting/       # Stage 6: 汇报文档排版与图表指南构建 (teacher_reports, best_subject, protocol)
+│
+├── tools/                      # 【诊断与维护工具】
+│   ├── sync_emg_summaries.py   # NPZ 与 JSON 摘要字段同步
+│   └── check_*.py              # 案例与通道有效性独立核验工具
+│
+├── utils/                      # 【通用支持库】
+│   ├── safety.py               # J: 严格只读断言与输出路径边界核查
+│   ├── config.py               # 路径常量、会话清单与任务 Marker 协议
+│   └── visualization.py        # 中文字体、统一配色与高分辨率画布配置
+│
+└── version.py                  # 全局版本常数与演进历史 (v8.0.0)
+```
+
+### 根目录经典门面接口映射
+
+为保证现有文档手册与命令行 100% 稳定运行，根目录继续提供兼容门面：
+
+| 根目录门面文件 | 模块化映射目标 | 职责定位 |
+| :--- | :--- | :--- |
+| [`main.py`](file:///d:/Python_File/EEF_analyze/main.py) | `src.stages.stage1_qc.pipeline` | 多模态离线质量评估 (QC) 主入口 |
+| [`preprocess.py`](file:///d:/Python_File/EEF_analyze/preprocess.py) | `src.stages.stage2_preprocess.pipeline` | 规范化去噪预处理与掩码提取主入口 (v8) |
+| [`emg_qc.py`](file:///d:/Python_File/EEF_analyze/emg_qc.py) | `src.modalities.emg.qc` | 表面肌电与 IMU 质量评估底层算法库 |
+| [`fnirs_qc.py`](file:///d:/Python_File/EEF_analyze/fnirs_qc.py) | `src.modalities.fnirs.qc` | 近红外脑血氧质量评估底层算法库 |
+| [`low_snr_recovery.py`](file:///d:/Python_File/EEF_analyze/low_snr_recovery.py) | `src.stages.stage3_recovery.low_snr_recovery` | 低信噪比信号实验性恢复探索 |
+| [`expand_all_cases.py`](file:///d:/Python_File/EEF_analyze/expand_all_cases.py) | `src.stages.stage4_features.expand_cases` | 全量病例特征展开与提取 |
+| [`summarize_expanded_results.py`](file:///d:/Python_File/EEF_analyze/summarize_expanded_results.py) | `src.stages.stage4_features.summarize_features` | 特征表多任务汇总与配对统计 |
+| [`quality_gated_phenotype.py`](file:///d:/Python_File/EEF_analyze/quality_gated_phenotype.py) | `src.stages.stage4_features.quality_gated_phenotype` | 质量门控表型构建与综合矩阵 |
+| [`integrate_tcm_reports.py`](file:///d:/Python_File/EEF_analyze/integrate_tcm_reports.py) | `src.modalities.multimodal.tcm_eye` | 中医四诊与眼动仪量化报告整合 |
+| [`plot_eeg_montage.py`](file:///d:/Python_File/EEF_analyze/plot_eeg_montage.py) | `src.modalities.eeg.montage` | 64导 EEG 国际 10-10 拓扑排布绘图 |
 
 ---
 
@@ -84,29 +114,39 @@
 
 ---
 
-## 4. `outputs/` 输出目录层次规范
+## 4. `outputs/` 统一归类与结果归纳
 
-`outputs/` 统一存放所有程序输出，其层次结构如下：
+所有生成物严格归纳于 `outputs/` 的规范分类目录中，杜绝版本混淆。详见 [06_RESULTS_CATALOG.md](file:///d:/Python_File/EEF_analyze/docs/06_RESULTS_CATALOG.md)：
 
 ```text
 outputs/
-├── analysis/               # 特征提取与高级分析产物
-│   ├── 20260903_all_cases_canonical/  # 18名基线全样本标准化分析
-│   └── paired7_20260903/              # 配对 7 人分阶段分析 (phase5~19)
-├── qc/                     # 质控输出根目录
-│   ├── current/            # main.py 默认输出目录
-│   └── local_repro_20260903/ # 本地复现运行质控
-├── preprocessed/           # 预处理数据根目录
-│   ├── current/            # preprocess.py 默认输出目录
-│   └── stage_20260904_...  # 历史验证过的阶段预处理数据
-├── release_20260903_paired7/ # 正式对外汇报发布包 (含报告、图表、源数据与哈希)
-├── release_20260903/       # 旧版 n=4 冻结归档发布包 (仅作审计留痕)
-├── doc_figures/            # 实验方案文档中引用的核心矢量/位图资源
-├── imu_posture_*/          # IMU 运动学与姿态代理提取产物
-├── mbll_reviewed_20260908/ # 相对 MBLL 敏感性分析产物 (含 run_manifest.json)
-└── _scratch/               # 临时审查、调试与中间生成物目录 (Git 忽略，可安全清空)
-    ├── plain_tmp/          # 临时报告渲染排版生成物
-    └── tmp/                # 临时图表与手工审查缓存
+├── qc/                              # [Stage 1] 多模态离线质量控制产物
+│   ├── current/                     # 全样本质控评估默认输出 (recording_inventory.csv + 逐记录诊断图)
+│   ├── local_repro_20260903/        # 配对 7 人本地副本复现质控评估产物
+│   └── 20260903_summary/            # 历史汇总快照
+├── preprocessed/                    # [Stage 2] 规范预处理清洗数据 (NPZ + index.json)
+│   ├── current/                     # 当前最新预处理成果 (v8: TDDR + WOLA + PASS)
+│   ├── stage_20260904_...           # 阶段验证预处理数据
+│   ├── v5_review_20260914/          # 2026-09-14 Review 态 (107记录，3 FAILED)
+│   └── v6_optimized_20260914/       # 2026-09-14 Optimized 态 (107记录，2 FAILED)
+├── analysis/                        # [Stage 4 & 5] 特征提取与专项假说分析
+│   ├── 20260903_all_cases_canonical/# 18名基线全样本标准化动作 Block 特征表
+│   ├── paired7_20260903/            # 配对 7 人分阶段分析 (Phase 1~19, 含 Phase 19 跨模态网络)
+│   ├── mbll_reviewed_20260908/      # 配对 7 人相对 MBLL 敏感性分析产物
+│   └── imu_posture_20260904/        # 表面肌电 Avanti IMU 1秒姿态角与运动强度代理
+├── reports/                         # [Stage 6] 成果汇报、图版指南与实验方案排布
+│   ├── protocols_and_montage/       # 实验方案 Word/PDF 修订版与 64 导 EEG 拓扑排布图
+│   ├── briefings/                   # 导师汇报简报与阶段总结
+│   ├── comparisons/                 # 最佳受试者 (2026081502/sec_test) 预处理前后对比全套图解
+│   └── teacher_reports/             # 阶段性导师汇报图文成果包 (20260904, 20260908)
+├── audit_ledgers/                   # [Stage 0] 原始数据扫描、安全同步与哈希审计账本
+│   ├── j_old_data_scan_20260902/    # J: 盘与本地目录哈希比对与重复分析
+│   ├── j_drive_data_inventory_20260902.csv # J: 盘只读资产总表
+│   └── local_data_inventory_20260902.csv   # 本地资产总表
+├── release/                         # 正式发布打包与哈希封存 (release_20260903_paired7 等)
+├── literature/                      # 外部方法学文献对照、迁移矩阵与搜索记录
+└── _scratch/                        # 临时审查、调试与中间沙盒 (Git 忽略，可安全清空)
+    └── recovery_v8_validation/      # v8 升级算法 (TDDR/WOLA/PASS) 诊断验证表与图表
 ```
 
 ---

@@ -29,9 +29,11 @@
 | 📖 [**文档中心首页**](file:///d:/Python_File/EEF_analyze/docs/README.md) | 文档导航总览、全流程系统架构图、文档更新与维护规范 | 快速总览系统全景 |
 | 🚀 [**01 执行入口清单**](file:///d:/Python_File/EEF_analyze/docs/01_ENTRYPOINTS.md) | Stage 0 到 Stage 6 核心业务执行入口、命令参数、输入输出及避坑指南 | 运行实验与批处理前必读 |
 | 🔬 [**02 多模态处理规范**](file:///d:/Python_File/EEF_analyze/docs/02_MULTIMODAL_PIPELINE.md) | EEG 64/32导配置、sEMG 逻辑肌肉映射、fNIRS 双波长 OD 与红外眼动干扰契约 | 信号清洗与门控算法标准 |
-| 📂 [**03 目录与资产全景**](file:///d:/Python_File/EEF_analyze/docs/03_DIRECTORY_LAYOUT.md) | 根目录结构、`scripts/` 分类表、`tests/` 测试集、`outputs/` 层次及历史阶段产物 | 代码资产与输出结构索引 |
+| 📂 [**03 目录与资产全景**](file:///d:/Python_File/EEF_analyze/docs/03_DIRECTORY_LAYOUT.md) | 根目录结构、`src/` 模块化代码库、`scripts/` 分类表、`outputs/` 层次及归档规范 | 代码资产与输出结构索引 |
 | ⏱️ [**04 事件标记与对齐**](file:///d:/Python_File/EEF_analyze/docs/04_EVENT_MARKERS.md) | Marker 1 定义、运动/眼动/静息任务标记结构、五标眼动反推算法与审计字段 | 跨模态时间同步核心标准 |
 | 🛡️ [**05 安全红线与治理**](file:///d:/Python_File/EEF_analyze/docs/05_SAFETY_AND_GOVERNANCE.md) | J: 只读红线、cwd 相对路径陷阱、`--overwrite` 递归删除风险及幂等复现准则 | 数据安全与运行前自查 |
+| 📊 [**06 结果归纳与指南**](file:///d:/Python_File/EEF_analyze/docs/06_RESULTS_CATALOG.md) | 质控报告、清洗 NPZ、特征表、汇报图文、发布包与审计账本全景归类与禁止混淆红线 | 成果查阅与结果解释边界 |
+| 🏷️ [**版本管理与演进**](file:///d:/Python_File/EEF_analyze/VERSION.md) | 系统版本 `v8.0.0`、预处理管线版本 `2026-11-09.v8-quality-tiered-recovery` 与演进矩阵 | 版本控制与溯源契约 |
 
 ---
 
@@ -91,16 +93,29 @@ python build_best_subject_preprocessing_comparison_20260914.py
 
 ```text
 D:\Python_File\EEF_analyze
-├── docs/                       # 系统化技术规范与执行手册 (01~05 专题)
-├── scripts/                    # 阶段性分析脚本 (Phase 1~19)、数据导入与报告工具
-├── tests/                      # pytest 自动化单元测试与冒烟测试集
-├── outputs/                    # 统一输出目录 (包含 analysis, qc, preprocessed, release, _scratch)
+├── src/                        # 模块化核心代码库 (按模态与阶段严格分层)
+│   ├── modalities/             # 模态底层库 (eeg, emg, fnirs, multimodal)
+│   ├── stages/                 # 执行流水线 (stage0_audit_sync ~ stage6_reporting)
+│   ├── tools/                  # 诊断与核对工具 (检查脚本、同步脚本)
+│   ├── utils/                  # 通用支持库 (安全断言、全局配置、可视化)
+│   └── version.py              # 全局版本常数与演进历史 (v8.0.0)
+├── docs/                       # 系统化技术规范与执行手册 (01~06 专题 + README)
+├── scripts/                    # 执行与阶段性脚本 (Phase 1~19、导入工具、汇报构建)
+├── tests/                      # pytest 自动化单元测试与冒烟测试集 (86 测试用例)
+├── outputs/                    # 统一输出目录 (按阶段与模态归类归纳)
+│   ├── qc/                     # [Stage 1] 离线质控 (current, local_repro_20260903)
+│   ├── preprocessed/           # [Stage 2] 规范预处理清洗 NPZ 与 index.json (current v8)
+│   ├── analysis/               # [Stage 4 & 5] 特征提取、MBLL 敏感性与跨模态网络
+│   ├── reports/                # [Stage 6] 方案文档、脑电排布图、对比图与汇报包
+│   ├── audit_ledgers/          # [Stage 0] J: 扫描、本地资产表与清理清单
+│   ├── release/                # 正式发布打包与哈希封存
+│   ├── literature/             # 外部文献迁移与搜索记录
+│   └── _scratch/               # 实验性算法沙盒与临时验证
 ├── data/                       # 本地原始数据工作目录 (由 .gitignore 忽略)
 ├── data_repro_20260903/        # 配对 7 人干净原始数据本地复现副本 (196 文件 + 核对表)
-├── main.py                     # 多模态独立采集质控 (QC) 核心主程序
-├── preprocess.py               # 规范去噪预处理与掩码提取核心主程序
-├── low_snr_recovery.py         # 低信噪比实验性恢复探索层
-├── expand_all_cases.py         # 多任务动作 Block 特征展开与提取
+├── main.py                     # 多模态独立采集质控 (QC) 核心门面主程序
+├── preprocess.py               # 规范去噪预处理与掩码提取核心门面主程序
+├── VERSION.md                  # 版本管理规范与管线演进历程
 └── requirements.txt            # 项目 Python 依赖声明
 ```
 

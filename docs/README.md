@@ -11,10 +11,12 @@
 | 序号 | 专题文档 | 主要内容与定位 | 核心涉及模块 / 入口 |
 | :--- | :--- | :--- | :--- |
 | **01** | [全流程与各阶段入口清单及执行手册](file:///d:/Python_File/EEF_analyze/docs/01_ENTRYPOINTS.md) | Stage 0 至 Stage 6 的 6 大业务执行入口、命令范例、参数释义、输入输出及避坑指南 | `main.py`, `preprocess.py`, `low_snr_recovery.py`, `expand_all_cases.py` 等 |
-| **02** | [多模态信号处理与质量门控规范](file:///d:/Python_File/EEF_analyze/docs/02_MULTIMODAL_PIPELINE.md) | EEG（64/32导帽、中位数重参考）、sEMG（7通道逻辑映射、IMU代理）、fNIRS（双波长OD、红外已知干扰）处理标准 | `emg_qc.py`, `fnirs_qc.py`, `preprocess.py`, `mbll_relative_sensitivity_reviewed_20260908.py` |
-| **03** | [项目目录与数据产物资产全景](file:///d:/Python_File/EEF_analyze/docs/03_DIRECTORY_LAYOUT.md) | 根目录结构、`scripts/` 工具库分类、`tests/` 自动化测试集、`outputs/` 分层规范及阶段归档说明 | 目录全貌、阶段性产物版本对照、临时文件流向 |
-| **04** | [事件标记与多模态时间对齐规范](file:///d:/Python_File/EEF_analyze/docs/04_EVENT_MARKERS.md) | Marker 1 定义、运动/眼动/静息任务时间同步逻辑、五标眼动记录反推算法及推荐数据字段 | `事件标记使用说明.md`, `explore_202608_cases.py`, `scripts/build_marker_alignment_audit.py` |
+| **02** | [多模态信号处理与质量门控规范](file:///d:/Python_File/EEF_analyze/docs/02_MULTIMODAL_PIPELINE.md) | EEG（64/32导帽、中位数重参考）、sEMG（7通道逻辑映射、IMU代理）、fNIRS（双波长OD、红外已知干扰）处理标准 | `src/modalities/`, `emg_qc.py`, `fnirs_qc.py`, `preprocess.py` |
+| **03** | [项目目录与数据产物资产全景](file:///d:/Python_File/EEF_analyze/docs/03_DIRECTORY_LAYOUT.md) | 根目录结构、`src/` 模块化代码库、`scripts/` 工具库、`tests/` 测试集、`outputs/` 分层规范及阶段归档说明 | 目录全貌、阶段性产物版本对照、临时文件流向 |
+| **04** | [事件标记与多模态时间对齐规范](file:///d:/Python_File/EEF_analyze/docs/04_EVENT_MARKERS.md) | Marker 1 定义、运动/眼动/静息任务时间同步逻辑、五标眼动记录反推算法及推荐数据字段 | `src/modalities/multimodal/`, `explore_202608_cases.py`, `scripts/build_marker_alignment_audit.py` |
 | **05** | [安全红线与数据治理规范](file:///d:/Python_File/EEF_analyze/docs/05_SAFETY_AND_GOVERNANCE.md) | J:\ 只读铁律、当前工作目录（cwd）与相对路径陷阱、`--overwrite` 递归安全、幂等性与可复现性机制 | 项目数据与运行安全规范 |
+| **06** | [项目结果全景归纳与资产使用指南](file:///d:/Python_File/EEF_analyze/docs/06_RESULTS_CATALOG.md) | 质控报告、预处理 NPZ、特征表、汇报图文、发布包与审计账本全景归类与禁止混淆红线 | `outputs/` 各分类目录、各阶段产物使用与解释边界 |
+| **VER** | [项目版本管理规范与演进历程](file:///d:/Python_File/EEF_analyze/VERSION.md) | 系统版本 `v8.0.0`、预处理管线版本 `2026-11-09.v8-quality-tiered-recovery` 与演进矩阵 | 代码与数据流水线版本追踪 |
 
 ---
 
