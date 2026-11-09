@@ -533,6 +533,36 @@ class PreprocessingTests(unittest.TestCase):
             self.assertEqual(exclusions[p_eye_dup][0], "EXCLUDED_CROSS_TASK_DUPLICATE")
             self.assertNotIn(p_rest, exclusions)
 
+    def test_v8_pipeline_tiered_recoveries(self) -> None:
+        fs = 250.0
+        time = np.arange(int(20 * fs)) / fs
+        # 1. EEG: Common-mode 2800 uV 50Hz hum must NOT trigger false clamp
+        hum_eeg = np.zeros((8, time.size), dtype=np.float32)
+        for i in range(8):
+            hum_eeg[i] = (15.0 * np.sin(2 * np.pi * 10.0 * time + i * 0.2) + 2800.0 * np.sin(2 * np.pi * 50.0 * time)).astype(np.float32)
+        _, disc_hum = clamp_eeg_disconnect_epochs(hum_eeg, None, None, None, fs)
+        self.assertFalse(bool(np.any(disc_hum)))
+
+        # 2. EMG: Hann WOLA harmonic cancellation
+        from preprocess import overlap_add_harmonic_cancel
+        emg_fs = 1000.0
+        emg_t = np.arange(int(10 * emg_fs)) / emg_fs
+        emg_sig = 50.0 * np.sin(2 * np.pi * 85.0 * emg_t) + 300.0 * np.sin(2 * np.pi * 50.0 * emg_t)
+        emg_clean = overlap_add_harmonic_cancel(emg_sig[None, :], emg_fs)[0]
+        # 50 Hz power should be suppressed by > 90%
+        self.assertLess(float(np.std(emg_clean - 50.0 * np.sin(2 * np.pi * 85.0 * emg_t))), 25.0)
+
+        # 3. fNIRS: Fishburn TDDR repairs step shifts
+        from preprocess import fishburn_tddr
+        nirs_fs = 10.0
+        nirs_t = np.arange(int(60 * nirs_fs)) / nirs_fs
+        od_clean = 0.05 * np.sin(2 * np.pi * 0.1 * nirs_t)
+        od_stepped = od_clean.copy()
+        od_stepped[int(30 * nirs_fs):] += 1.5
+        repaired_od, spike_pct = fishburn_tddr(od_stepped, nirs_fs)
+        # Step should be flattened significantly
+        self.assertLess(float(np.ptp(repaired_od)), 0.6)
+
 
 if __name__ == "__main__":
     unittest.main()

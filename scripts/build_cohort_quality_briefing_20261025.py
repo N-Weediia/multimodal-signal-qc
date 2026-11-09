@@ -173,7 +173,7 @@ def collect_briefing_data() -> dict[str, Any]:
                         state = "GOOD" if score >= 80 else ("CAUTION" if score >= 65 else "DEGRADED")
                     elif mod == "EMG":
                         st_map = s.get("channel_quality_status") or {}
-                        good_m = sum(v in ("GOOD", "CAUTION") for v in st_map.values())
+                        good_m = sum(v in ("GOOD", "CAUTION", "CAUTION_HIGH_RAW_LINE") for v in st_map.values())
                         tot_m = max(1, len(st_map))
                         win_vals = list((s.get("window_quality") or {}).get("valid_window_percent_by_channel", {}).values())
                         win_pct = float(np.mean(win_vals)) if win_vals else 0.0

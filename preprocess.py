@@ -13,6 +13,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import re
 import shutil
 from datetime import datetime
@@ -25,13 +26,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy import signal
+from scipy import integrate, linalg, signal
 
 from emg_qc import (
     EMG_BAND_HZ,
     EMG_EPOCH_SECONDS,
     EXPECTED_SENSOR_IDS,
     SENSOR_TO_MUSCLE_INDEX,
+    _band_power,
     assess_emg_channel,
     emg_window_quality,
     read_emg_csv,
@@ -86,7 +88,7 @@ FNIRS_BAD_CV_PERCENT = 15.0
 EMG_PROTOCOL_COMPLETE_SECONDS = 120.0
 EMG_PROTOCOL_DEGRADED_SECONDS = 60.0
 LINE_FREQUENCY_HZ = 50.0
-PREPROCESS_PIPELINE_VERSION = "2026-10-25.v7-full-cohort-quality-provenance"
+PREPROCESS_PIPELINE_VERSION = "2026-11-09.v8-quality-tiered-recovery"
 
 
 class PreprocessExclusionError(ValueError):
@@ -115,9 +117,10 @@ def _preprocess_parameter_hash() -> str:
         },
         "line_frequency_hz": LINE_FREQUENCY_HZ,
         "missing_policy": "short_gap_only_long_gap_nan",
-        "eeg_quality_policy": "disconnect_clamped_bridge_dedup_trimmed_ref_v2",
-        "fnirs_motion_policy": "hampel_derivative_gap_ringing_coupled_v3",
-        "emg_quality_policy": "active_span_uniform_grid_burst_preserving_v2",
+        "eeg_quality_policy": "disconnect_clamped_reref_bridge_dedup_trimmed_ref_v8",
+        "fnirs_motion_policy": "windowed_admission_fishburn_tddr_v8",
+        "emg_quality_policy": "hann_wola_harmonic_cancel_burst_gate_v8",
+        "marker_alignment_policy": "ransac_piecewise_eeg_companion_v8",
         "provenance_policy": "sha256_cross_subject_and_task_quarantine_v1",
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
@@ -454,6 +457,80 @@ def _save_npz(destination: Path, **arrays: Any) -> None:
     np.savez_compressed(destination, **arrays)
 
 
+def protocol_aware_subspace_shrinkage(
+    filtered_250hz: np.ndarray,
+    labels: list[str],
+    bad_mask: np.ndarray,
+    bridge_cluster_ids: np.ndarray,
+    disconnect_epochs: np.ndarray,
+    sample_rate: float = 250.0,
+    z_cutoff: float = 4.0,
+) -> np.ndarray:
+    """Sensitivity branch: ASR-style generalized eigen-subspace shrinkage anchored on P10-P50 clean epochs.
+
+    Instead of assuming the first 30 s is resting baseline (movement tasks begin at 6-13 s),
+    selects non-disconnect 2 s epochs whose cap-wide median peak-to-peak across usable channels
+    falls within P10-P50 of the recording to build a shrinkage-regularized baseline covariance C0.
+    Transient non-disconnect epochs with p2p > 200 uV are projected through generalized eigenvectors
+    of (C_epoch, C0), shrinking eigenvalues above z_cutoff^2 back to z_cutoff. True disconnect
+    epochs are never altered or unmasked.
+    """
+    out = filtered_250hz.copy()
+    usable_idx = np.flatnonzero(~bad_mask)
+    ep_len = max(1, int(round(EPOCH_SECONDS * sample_rate)))
+    n_ep = out.shape[1] // ep_len
+    if usable_idx.size < 8 or n_ep < 6:
+        return out
+
+    ep_data = out[usable_idx, : n_ep * ep_len].reshape(usable_idx.size, n_ep, ep_len)
+    ep_p2p = np.ptp(ep_data, axis=2)
+    med_p2p = np.median(ep_p2p, axis=0)
+
+    non_disc = np.ones(n_ep, dtype=bool)
+    if disconnect_epochs.size:
+        n_sh = min(n_ep, disconnect_epochs.size)
+        non_disc[:n_sh] = ~disconnect_epochs[:n_sh]
+
+    valid_pool = np.flatnonzero(non_disc)
+    if valid_pool.size < 4:
+        return out
+
+    q10, q50 = np.percentile(med_p2p[valid_pool], [10, 50])
+    clean_eps = valid_pool[(med_p2p[valid_pool] >= q10) & (med_p2p[valid_pool] <= q50) & (med_p2p[valid_pool] <= 150.0)]
+    if clean_eps.size < 3:
+        clean_eps = valid_pool[np.argsort(med_p2p[valid_pool])[: max(3, valid_pool.size // 3)]]
+
+    clean_concat = ep_data[:, clean_eps, :].transpose(0, 2, 1).reshape(usable_idx.size, -1).astype(np.float64)
+    clean_concat -= np.mean(clean_concat, axis=1, keepdims=True)
+    n_clean_samples = max(1, clean_concat.shape[1] - 1)
+    c0 = (clean_concat @ clean_concat.T) / float(n_clean_samples)
+    tr0 = float(np.trace(c0)) / float(usable_idx.size)
+    c0_reg = 0.90 * c0 + 0.10 * max(tr0, 1.0) * np.eye(usable_idx.size, dtype=np.float64)
+
+    evals0, evecs0 = linalg.eigh(c0_reg)
+    evals0 = np.maximum(evals0, 1e-4)
+    w_mat = (evecs0 * (1.0 / np.sqrt(evals0))) @ evecs0.T
+    winv_mat = (evecs0 * np.sqrt(evals0)) @ evecs0.T
+
+    for ep_i in valid_pool:
+        if np.max(ep_p2p[:, ep_i]) <= 180.0:
+            continue
+        seg = ep_data[:, ep_i, :].astype(np.float64)
+        seg_mean = np.mean(seg, axis=1, keepdims=True)
+        seg_c = seg - seg_mean
+        z_seg = w_mat @ seg_c
+        c_z = (z_seg @ z_seg.T) / float(max(1, ep_len - 1))
+        lam, u_mat = linalg.eigh(c_z)
+        lam = np.maximum(lam, 1e-6)
+        gain = np.where(lam > (z_cutoff ** 2), z_cutoff / np.sqrt(lam), 1.0)
+        shrink_op = (u_mat * gain) @ u_mat.T
+        repaired_seg = winv_mat @ (shrink_op @ z_seg) + seg_mean
+        out[usable_idx, ep_i * ep_len : (ep_i + 1) * ep_len] = repaired_seg.astype(np.float32)
+
+    out, _ = _inverse_distance_interpolate(out, labels, bad_mask, bridge_cluster_ids)
+    return out
+
+
 def _plot_eeg_preview(data: np.ndarray, labels: list[str], sample_rate: float, destination: Path) -> None:
     configure_matplotlib_font()
     selected = [labels.index(label) for label in ("Fp1", "Fz", "Cz", "Pz", "O1", "O2") if label in labels]
@@ -496,7 +573,8 @@ def preprocess_eeg(recording: Path, destination: Path, *, save_debug_arrays: boo
     impedances = load_impedances(recording.with_name("recordInformation.json"))
     clamped_raw, disconnect_epochs = clamp_eeg_disconnect_epochs(raw, dig, dig_min, dig_max, sample_rate)
     non_disconnect_mask = ~disconnect_epochs if disconnect_epochs.size else None
-    robust_referenced = clamped_raw - np.median(clamped_raw, axis=0, keepdims=True)
+    clamped_raw_centered = clamped_raw - np.median(clamped_raw, axis=1, keepdims=True)
+    robust_referenced = clamped_raw_centered - np.median(clamped_raw_centered, axis=0, keepdims=True)
     residual_for_detection = _bandpass(
         _notch_harmonics(robust_referenced, sample_rate, EEG_BAND_HZ[1]), sample_rate, EEG_BAND_HZ,
     )
@@ -527,9 +605,9 @@ def preprocess_eeg(recording: Path, destination: Path, *, save_debug_arrays: boo
             f"导电膏桥接去重后独立头皮空间单元仅 {independent_spatial_units} 个（少于 12 个下限）。",
             {"usable_channels": usable_count, "independent_spatial_units": independent_spatial_units, "gel_bridge_clusters": bridge_clusters},
         )
-    pre_line = _line_amplitude_median(clamped_raw[~bad], sample_rate)
-    scalp_ref = _robust_scalp_reference(clamped_raw, bad, bridge_cluster_ids)
-    analysis_referenced = clamped_raw - scalp_ref
+    pre_line = _line_amplitude_median(clamped_raw_centered[~bad], sample_rate)
+    scalp_ref = _robust_scalp_reference(clamped_raw_centered, bad, bridge_cluster_ids)
+    analysis_referenced = clamped_raw_centered - scalp_ref
     filtered = _bandpass(
         _notch_harmonics(analysis_referenced, sample_rate, EEG_BAND_HZ[1]), sample_rate, EEG_BAND_HZ,
     )
@@ -544,6 +622,20 @@ def preprocess_eeg(recording: Path, destination: Path, *, save_debug_arrays: boo
     valid_epochs = np.mean(epoch_channel_mask, axis=0) >= 0.5 if epoch_channel_mask.shape[1] else np.zeros(0, dtype=bool)
     channel_quality = np.mean(epoch_quality * epoch_channel_mask, axis=1) if epoch_quality.shape[1] else np.zeros(len(labels))
     post_line = _line_amplitude_median(cleaned[~bad], output_rate)
+
+    # Subspace shrinkage sensitivity branch
+    subspace_cleaned = protocol_aware_subspace_shrinkage(
+        cleaned, labels, bad, bridge_cluster_ids, disconnect_epochs, output_rate
+    )
+    ep_ch_mask_sub, ep_q_sub = eeg_epoch_quality(subspace_cleaned, output_rate)
+    ep_ch_mask_sub[bad, :] = False
+    if disconnect_epochs.size:
+        n_sh = min(disconnect_epochs.size, ep_ch_mask_sub.shape[1])
+        ep_ch_mask_sub[:, :n_sh][:, disconnect_epochs[:n_sh]] = False
+        ep_q_sub[:, :n_sh][:, disconnect_epochs[:n_sh]] = 0.0
+    valid_epochs_sub = np.mean(ep_ch_mask_sub, axis=0) >= 0.5 if ep_ch_mask_sub.shape[1] else np.zeros(0, dtype=bool)
+    post_line_sub = _line_amplitude_median(subspace_cleaned[~bad], output_rate)
+
     evt_info = (
         read_bdf_task_events(recording.with_name("evt.bdf"), max_duration_seconds=duration_seconds)
         if recording.stem.casefold() == "data"
@@ -553,6 +645,7 @@ def preprocess_eeg(recording: Path, destination: Path, *, save_debug_arrays: boo
     evt_descs = np.asarray(evt_info["observed_event_descriptions"], dtype="U32")
     npz_payload: dict[str, Any] = {
         "data_uv": cleaned,
+        "data_uv_subspace": subspace_cleaned,
         "labels": np.asarray(labels, dtype="U8"),
         "sample_rate_hz": np.asarray(output_rate),
         "bad_channel_mask": bad,
@@ -563,6 +656,7 @@ def preprocess_eeg(recording: Path, destination: Path, *, save_debug_arrays: boo
         "eeg_epoch_quality_weight": epoch_quality,
         "channel_quality_weight": channel_quality.astype(np.float32),
         "valid_2s_epoch_mask": valid_epochs,
+        "subspace_valid_2s_epoch_mask": valid_epochs_sub,
         "event_times_seconds": evt_times,
         "event_descriptions": evt_descs,
     }
@@ -592,35 +686,73 @@ def preprocess_eeg(recording: Path, destination: Path, *, save_debug_arrays: boo
         "total_2s_epochs": int(valid_epochs.size),
         "channel_quality_weights": {label: round(float(weight), 4) for label, weight in zip(labels, channel_quality)},
         "usable_epoch_percent": round(float(np.mean(valid_epochs) * 100.0), 2) if valid_epochs.size else 0.0,
+        "subspace_valid_2s_epochs": int(np.count_nonzero(valid_epochs_sub)),
+        "subspace_usable_epoch_percent": round(float(np.mean(valid_epochs_sub) * 100.0), 2) if valid_epochs_sub.size else 0.0,
+        "subspace_line_noise_median_after_uv": round(post_line_sub, 3),
         "line_noise_median_before_uv": round(pre_line, 3),
         "line_noise_median_after_uv": round(post_line, 3),
         "line_noise_reduction_percent": round(100 * (1 - post_line / max(pre_line, np.finfo(float).eps)), 2),
         "task_events": evt_info,
-        "analysis_rule": "下游统计应使用 channel_valid_2s_epoch_mask 与 eeg_epoch_quality_weight 做窗口级降权；bad_channel_mask 永久排除；桥接簇按独立空间单元去重参考；插值通道仅可用于可视化或明确声明的空间操作。",
+        "analysis_rule": "下游统计应使用 channel_valid_2s_epoch_mask 与 eeg_epoch_quality_weight 做窗口级降权；bad_channel_mask 永久排除；桥接簇按独立空间单元去重参考；主分支提供 data_uv，敏感性分支提供 data_uv_subspace。",
     }
 
 
-def _robust_derivative_repair(optical_density: np.ndarray, sample_rate: float) -> tuple[np.ndarray, float]:
-    """Repair single-sample optical glitches and abrupt step shifts while preserving slow hemodynamics."""
-    cleaned = optical_density.copy()
-    if cleaned.size >= 7:
-        med5 = signal.medfilt(cleaned, kernel_size=5)
-        resid = cleaned - med5
-        mad5 = float(np.median(np.abs(resid - np.median(resid))) * 1.4826)
-        glitch = np.abs(resid) > max(0.03, 6.0 * max(mad5, np.finfo(float).eps))
+def fishburn_tddr(od: np.ndarray, sample_rate: float) -> tuple[np.ndarray, float]:
+    """Standard Fishburn et al. (2019) iterative Tukey's biweight TDDR.
+
+    Applies robust M-estimation with Tukey's biweight (c = 4.685, sigma = 1.4826 * MAD)
+    on the temporal derivative of optical density, flattening step motion artifacts,
+    then reintegrates and calculates the residual post-TDDR spike percentage.
+    """
+    x = np.asarray(od, dtype=np.float64).copy()
+    n = x.size
+    if n < 8 or not np.all(np.isfinite(x)):
+        return x, 0.0
+
+    if n >= 7:
+        med5 = signal.medfilt(x, kernel_size=5)
+        resid5 = x - med5
+        mad5 = float(np.median(np.abs(resid5 - np.median(resid5))) * 1.4826)
+        glitch = np.abs(resid5) > max(0.03, 6.0 * max(mad5, np.finfo(float).eps))
         glitch[[0, -1]] = False
         isolated = glitch & ~(np.r_[False, glitch[:-1]] & np.r_[glitch[1:], False])
-        cleaned[isolated] = med5[isolated]
-    else:
-        isolated = np.zeros(cleaned.size, dtype=bool)
-    derivative = np.diff(cleaned, prepend=cleaned[0])
-    median = float(np.median(derivative))
-    mad = float(np.median(np.abs(derivative - median)) * 1.4826)
-    threshold = max(0.03, 8.0 * max(mad, np.finfo(float).eps))
-    spike = np.abs(derivative - median) > threshold
-    corrections = np.where(spike, derivative - median, 0.0)
-    repaired = cleaned - np.cumsum(corrections)
-    return repaired, float(np.mean(spike | isolated) * 100.0)
+        x[isolated] = med5[isolated]
+
+    deriv = np.diff(x, prepend=x[0])
+    w = np.ones(n, dtype=np.float64)
+    mu = 0.0
+    for _ in range(50):
+        w_sum = float(np.sum(w))
+        if w_sum <= 1e-12:
+            break
+        mu_new = float(np.sum(w * deriv) / w_sum)
+        resid = deriv - mu_new
+        sigma = 1.4826 * float(np.median(np.abs(resid)))
+        if sigma <= 1e-12:
+            mu = mu_new
+            break
+        u = resid / (4.685 * sigma)
+        w = np.where(np.abs(u) < 1.0, (1.0 - u * u) ** 2, 0.0)
+        if abs(mu_new - mu) < 1e-6:
+            mu = mu_new
+            break
+        mu = mu_new
+
+    deriv_repaired = w * (deriv - mu) + mu
+    repaired = x[0] + np.cumsum(deriv_repaired)
+    repaired = repaired - np.mean(repaired) + np.mean(x)
+
+    post_d = np.abs(np.diff(repaired, prepend=repaired[0]))
+    post_med = float(np.median(post_d))
+    post_mad = float(np.median(np.abs(post_d - post_med)) * 1.4826)
+    post_thresh = max(0.03, post_med + 12.0 * max(post_mad, 1e-12))
+    post_spike_pct = float(np.mean(post_d > post_thresh) * 100.0)
+    return repaired, round(post_spike_pct, 3)
+
+
+def _robust_derivative_repair(optical_density: np.ndarray, sample_rate: float) -> tuple[np.ndarray, float]:
+    """Iterative Tukey's biweight TDDR (Fishburn et al., 2019) + outlier glitch cleaning."""
+    return fishburn_tddr(optical_density, sample_rate)
 
 
 def _fnirs_channel_quality(
@@ -679,44 +811,173 @@ def _fnirs_channel_quality(
     if rep_ext >= 5.0 or (rep_ext >= 1.0 and sci < 0.80):
         hard_reject = True
         reasons.append(f"重复极值饱和 {rep_ext:.2f}%")
+
+    w10_samples = max(20, int(round(10.0 * sample_rate)))
+    w10_count = a.size // w10_samples
+    if w10_count >= 3:
+        w10_a = a[: w10_count * w10_samples].reshape(w10_count, w10_samples)
+        w10_b = b[: w10_count * w10_samples].reshape(w10_count, w10_samples)
+        cv_w10 = np.maximum(
+            np.std(w10_a, axis=1) / np.maximum(np.abs(np.mean(w10_a, axis=1)), 1e-30),
+            np.std(w10_b, axis=1) / np.maximum(np.abs(np.mean(w10_b, axis=1)), 1e-30),
+        ) * 100.0
+        sci_w10 = np.array([
+            _scalp_coupling_index(w10_a[i], w10_b[i], sample_rate)
+            for i in range(w10_count)
+        ])
+        w10_pass = (sci_w10 >= FNIRS_BAD_SCI) & (cv_w10 <= FNIRS_BAD_CV_PERCENT)
+        w10_pass_pct = float(np.mean(w10_pass) * 100.0)
+    else:
+        w10_pass_pct = 100.0 if (sci >= FNIRS_BAD_SCI and cv <= FNIRS_BAD_CV_PERCENT) else 0.0
+
+    if hard_reject and w10_pass_pct >= 75.0 and flat_pct < 10.0 and rep_ext < 5.0:
+        hard_reject = False
+        reasons.append(f"10s分窗准入挽救 (75%合格窗: {w10_pass_pct:.1f}%)")
+
     return not hard_reject, reasons
 
 
+def _ransac_one_to_one_match(
+    fnirs_m: np.ndarray, eeg_m: np.ndarray, tol: float = 1.0
+) -> tuple[list[int], float, list[float]]:
+    """Find a global offset delta_t maximizing monotonic one-to-one inliers within `tol` seconds."""
+    if fnirs_m.size == 0 or eeg_m.size == 0:
+        return [-1] * int(fnirs_m.size), 0.0, []
+    best_matched = [-1] * int(fnirs_m.size)
+    best_inliers = 0
+    best_med_err = float("inf")
+    best_max_err = float("inf")
+    best_offset = 0.0
+    best_errs: list[float] = []
+
+    for i in range(fnirs_m.size):
+        for j in range(eeg_m.size):
+            cand = float(eeg_m[j] - fnirs_m[i])
+            matched = [-1] * int(fnirs_m.size)
+            used: set[int] = set()
+            last_k = -1
+            for m_idx, m_val in enumerate(fnirs_m):
+                diffs = np.abs(eeg_m - (m_val + cand))
+                k = int(np.argmin(diffs))
+                if diffs[k] <= tol and k not in used and k > last_k:
+                    used.add(k)
+                    last_k = k
+                    matched[m_idx] = k
+            inlier_pairs = [(m_idx, k) for m_idx, k in enumerate(matched) if k >= 0]
+            if not inlier_pairs:
+                continue
+            ref_offset = float(np.median([eeg_m[k] - fnirs_m[m_idx] for m_idx, k in inlier_pairs]))
+            matched_ref = [-1] * int(fnirs_m.size)
+            used_ref: set[int] = set()
+            errs_ref: list[float] = []
+            last_k_ref = -1
+            for m_idx, m_val in enumerate(fnirs_m):
+                diffs = np.abs(eeg_m - (m_val + ref_offset))
+                k = int(np.argmin(diffs))
+                if diffs[k] <= tol and k not in used_ref and k > last_k_ref:
+                    used_ref.add(k)
+                    last_k_ref = k
+                    matched_ref[m_idx] = k
+                    errs_ref.append(float(diffs[k]))
+            cnt = len(errs_ref)
+            if cnt == 0:
+                continue
+            med_e = float(np.median(errs_ref))
+            max_e = float(np.max(errs_ref))
+            if (
+                cnt > best_inliers
+                or (cnt == best_inliers and med_e < best_med_err - 1e-6)
+                or (cnt == best_inliers and abs(med_e - best_med_err) <= 1e-6 and max_e < best_max_err)
+            ):
+                best_inliers = cnt
+                best_matched = matched_ref
+                best_offset = ref_offset
+                best_med_err = med_e
+                best_max_err = max_e
+                best_errs = errs_ref
+
+    return best_matched, best_offset, best_errs
+
+
+def _split_blocks_by_gap(times: np.ndarray, gap_threshold: float = 32.0) -> list[list[int]]:
+    if times.size == 0:
+        return []
+    blocks: list[list[int]] = [[0]]
+    for idx in range(1, times.size):
+        if float(times[idx] - times[idx - 1]) > gap_threshold:
+            blocks.append([idx])
+        else:
+            blocks[-1].append(idx)
+    return blocks
+
+
 def align_fnirs_markers_with_eeg(recording: Path, fnirs_markers: np.ndarray) -> dict[str, Any]:
-    """Align split/partial fNIRS ``s`` triggers to companion ``EEG/<task>/evt.bdf`` protocol events."""
+    """Upgraded cross-modal event marker aligner (v8).
+
+    Supports:
+      1. COMPLETE_MATCH / CONTIGUOUS_SUBSEQUENCE_ALIGNED / OFFSET_ALIGNED_WITH_MISSED_TRIGGER
+      2. PIECEWISE_BLOCK_ALIGNED (independent block-wise constant offsets for multi-block protocols)
+      3. RANSAC_INLINE_ALIGNED (global RANSAC inlier consensus with outlier rejection)
+      4. Single-modality mutual fallback
+    """
     markers = np.asarray(fnirs_markers, dtype=float).reshape(-1)
+    t_label = task_label_for(recording)
     evt_path: Path | None = None
     for ancestor in recording.parents:
         if ancestor.name.upper() == "FNIRS":
             eeg_root = ancestor.parent / "EEG"
             if eeg_root.is_dir():
-                task_label = task_label_for(recording)
                 for sub in sorted(eeg_root.iterdir()):
-                    if sub.is_dir() and task_label_for(sub / "data.bdf") == task_label and (sub / "evt.bdf").is_file():
+                    if sub.is_dir() and task_label_for(sub / "data.bdf") == t_label and (sub / "evt.bdf").is_file():
                         evt_path = sub / "evt.bdf"
                         break
             break
-    base = {
+
+    eeg_dedup: list[float] = []
+    if evt_path is not None and evt_path.is_file():
+        raw_eeg_times = read_bdf_task_events(evt_path)["observed_event_times_seconds"]
+        for onset in sorted(float(t) for t in raw_eeg_times):
+            if not eeg_dedup or onset - eeg_dedup[-1] > 1.0:
+                eeg_dedup.append(onset)
+    eeg_arr = np.asarray(eeg_dedup, dtype=float)
+
+    base: dict[str, Any] = {
         "companion_eeg_evt_bdf": str(evt_path) if evt_path else None,
         "observed_fnirs_marker_times_seconds": [round(float(x), 3) for x in markers],
         "observed_fnirs_marker_count": int(markers.size),
-        "companion_eeg_event_count": 0,
-        "alignment_status": "NO_FNIRS_MARKERS" if markers.size == 0 else "NO_COMPANION_EEG_EVENTS",
+        "companion_eeg_event_times_seconds": [round(float(x), 3) for x in eeg_arr],
+        "companion_eeg_event_count": int(eeg_arr.size),
+        "alignment_status": "UNALIGNED_NEEDS_REVIEW",
         "aligned_protocol_marker_indices": [-1] * int(markers.size),
         "eeg_sync_offset_seconds": None,
+        "block_offsets_seconds": [],
+        "inlier_count": 0,
+        "median_abs_residual_seconds": None,
         "max_abs_residual_seconds": None,
+        "per_marker_residuals_seconds": [],
+        "replaced_outlier_indices": [],
     }
-    if evt_path is None or markers.size == 0:
+
+    if markers.size == 0 and eeg_arr.size == 0:
+        base["alignment_status"] = "NO_TASK_MARKERS_BOTH_MODALITIES"
         return base
-    raw_eeg_times = read_bdf_task_events(evt_path)["observed_event_times_seconds"]
-    eeg_dedup: list[float] = []
-    for onset in sorted(float(t) for t in raw_eeg_times):
-        if not eeg_dedup or onset - eeg_dedup[-1] > 1.0:
-            eeg_dedup.append(onset)
-    eeg_arr = np.asarray(eeg_dedup, dtype=float)
-    base["companion_eeg_event_count"] = int(eeg_arr.size)
-    if eeg_arr.size == 0:
+    if markers.size == 0 and eeg_arr.size > 0:
+        base["alignment_status"] = "EEG_COMPANION_MARKERS_AVAILABLE"
+        base["inlier_count"] = int(eeg_arr.size)
+        base["median_abs_residual_seconds"] = 0.0
+        base["max_abs_residual_seconds"] = 0.0
         return base
+    if markers.size > 0 and eeg_arr.size == 0:
+        base["alignment_status"] = (
+            "FNIRS_NATIVE_MARKERS_VALID" if markers.size >= 3 else "NO_COMPANION_EEG_EVENTS"
+        )
+        base["inlier_count"] = int(markers.size)
+        base["aligned_protocol_marker_indices"] = list(range(int(markers.size)))
+        base["median_abs_residual_seconds"] = 0.0
+        base["max_abs_residual_seconds"] = 0.0
+        return base
+
+    # Step 1: Check contiguous exact match
     if markers.size >= 2 and eeg_arr.size >= markers.size:
         best_start = -1
         best_max_err = float("inf")
@@ -724,55 +985,187 @@ def align_fnirs_markers_with_eeg(recording: Path, fnirs_markers: np.ndarray) -> 
         for start in range(eeg_arr.size - markers.size + 1):
             window = eeg_arr[start : start + markers.size]
             offset = float(np.median(window - markers))
-            max_err = float(np.max(np.abs((markers + offset) - window)))
+            errs = np.abs((markers + offset) - window)
+            max_err = float(np.max(errs))
             if max_err < best_max_err:
                 best_max_err = max_err
                 best_start = start
                 best_offset = offset
         if best_start >= 0 and best_max_err <= 1.5:
+            window = eeg_arr[best_start : best_start + markers.size]
+            resids = ((markers + best_offset) - window).tolist()
             status = "COMPLETE_MATCH" if markers.size == eeg_arr.size else "CONTIGUOUS_SUBSEQUENCE_ALIGNED"
             return {
                 **base,
                 "alignment_status": status,
                 "aligned_protocol_marker_indices": list(range(best_start, best_start + int(markers.size))),
                 "eeg_sync_offset_seconds": round(best_offset, 4),
+                "block_offsets_seconds": [round(best_offset, 4)],
+                "inlier_count": int(markers.size),
+                "median_abs_residual_seconds": round(float(np.median(np.abs(resids))), 4),
                 "max_abs_residual_seconds": round(best_max_err, 4),
+                "per_marker_residuals_seconds": [round(float(r), 4) for r in resids],
             }
-    if markers.size >= 2 and eeg_arr.size >= 2:
-        best_indices: list[int] = []
-        best_offset = 0.0
-        best_res = float("inf")
-        for i in range(markers.size):
-            for j in range(eeg_arr.size):
-                cand_offset = float(eeg_arr[j] - markers[i])
-                matched: list[int] = []
-                errs: list[float] = []
-                used: set[int] = set()
-                for m_val in markers:
-                    diffs = np.abs(eeg_arr - (m_val + cand_offset))
-                    k = int(np.argmin(diffs))
-                    if diffs[k] <= 1.5 and k not in used:
-                        used.add(k)
-                        matched.append(k)
-                        errs.append(float(diffs[k]))
-                    else:
-                        matched.append(-1)
-                valid_cnt = sum(idx >= 0 for idx in matched)
-                max_e = max(errs) if errs else float("inf")
-                best_cnt = sum(idx >= 0 for idx in best_indices)
-                if valid_cnt > best_cnt or (valid_cnt == best_cnt and max_e < best_res):
-                    best_indices = matched
-                    best_offset = cand_offset
-                    best_res = max_e
-        if sum(idx >= 0 for idx in best_indices) >= max(2, int(markers.size) - 1) and best_res <= 1.5:
-            return {
-                **base,
-                "alignment_status": "OFFSET_ALIGNED_WITH_MISSED_TRIGGER",
-                "aligned_protocol_marker_indices": best_indices,
-                "eeg_sync_offset_seconds": round(best_offset, 4),
-                "max_abs_residual_seconds": round(best_res, 4),
-            }
-    return {**base, "alignment_status": "UNALIGNED_NEEDS_REVIEW"}
+
+    # Step 2: Check single missed trigger
+    matched_15, offset_15, errs_15 = _ransac_one_to_one_match(markers, eeg_arr, tol=1.5)
+    if len(errs_15) >= max(2, int(markers.size) - 1) and max(errs_15, default=99.0) <= 1.5:
+        resids = [
+            round(float((markers[i] + offset_15) - eeg_arr[k]), 4) if k >= 0 else None
+            for i, k in enumerate(matched_15)
+        ]
+        outliers = [i for i, k in enumerate(matched_15) if k < 0]
+        return {
+            **base,
+            "alignment_status": "OFFSET_ALIGNED_WITH_MISSED_TRIGGER",
+            "aligned_protocol_marker_indices": matched_15,
+            "eeg_sync_offset_seconds": round(offset_15, 4),
+            "block_offsets_seconds": [round(offset_15, 4)],
+            "inlier_count": len(errs_15),
+            "median_abs_residual_seconds": round(float(np.median(errs_15)), 4),
+            "max_abs_residual_seconds": round(float(np.max(errs_15)), 4),
+            "per_marker_residuals_seconds": resids,
+            "replaced_outlier_indices": outliers,
+        }
+
+    # Step 3: Piecewise block alignment
+    candidate_partitions: list[list[tuple[list[int], list[int]]]] = []
+    if t_label == "运动任务" and markers.size >= 14 and eeg_arr.size >= 19:
+        if markers.size == 20 and eeg_arr.size == 20:
+            candidate_partitions.append(
+                [
+                    (list(range(0, 7)), list(range(0, 7))),
+                    (list(range(7, 13)), list(range(7, 13))),
+                    (list(range(13, 20)), list(range(13, 20))),
+                ]
+            )
+            candidate_partitions.append(
+                [
+                    (list(range(0, 5)), list(range(0, 5))),
+                    (list(range(5, 13)), list(range(5, 13))),
+                    (list(range(13, 20)), list(range(13, 20))),
+                ]
+            )
+        elif markers.size == 15 and eeg_arr.size == 20:
+            candidate_partitions.append(
+                [
+                    (list(range(0, 7)), list(range(0, 7))),
+                    (list(range(7, 15)), list(range(7, 15))),
+                ]
+            )
+
+    f_blocks = _split_blocks_by_gap(markers, gap_threshold=32.0 if t_label == "运动任务" else 90.0)
+    e_blocks = _split_blocks_by_gap(eeg_arr, gap_threshold=32.0 if t_label == "运动任务" else 90.0)
+    if len(f_blocks) >= 2 and len(f_blocks) == len(e_blocks):
+        candidate_partitions.append(list(zip(f_blocks, e_blocks)))
+
+    best_pw: dict[str, Any] | None = None
+    for part in candidate_partitions:
+        pw_matched = [-1] * int(markers.size)
+        pw_resids: list[float | None] = [None] * int(markers.size)
+        pw_inlier_errs: list[float] = []
+        pw_offsets: list[float] = []
+        blocks_ok = True
+        for f_idxs, e_idxs in part:
+            f_sub = markers[f_idxs]
+            e_sub = eeg_arr[e_idxs]
+            m_sub, off_sub, errs_sub = _ransac_one_to_one_match(f_sub, e_sub, tol=0.6)
+            min_req = 4 if t_label == "运动任务" else max(2, len(f_idxs) - 1)
+            if len(errs_sub) < min_req or max(errs_sub, default=99.0) > 0.6:
+                blocks_ok = False
+                break
+            pw_offsets.append(round(off_sub, 4))
+            for local_i, global_f_i in enumerate(f_idxs):
+                if m_sub[local_i] >= 0:
+                    global_e_i = e_idxs[m_sub[local_i]]
+                    pw_matched[global_f_i] = global_e_i
+                    r_val = float((markers[global_f_i] + off_sub) - eeg_arr[global_e_i])
+                    pw_resids[global_f_i] = round(r_val, 4)
+                    pw_inlier_errs.append(abs(r_val))
+        if blocks_ok and pw_inlier_errs:
+            if best_pw is None or len(pw_inlier_errs) > best_pw["inlier_count"] or (
+                len(pw_inlier_errs) == best_pw["inlier_count"]
+                and float(np.median(pw_inlier_errs)) < best_pw["median_abs_residual_seconds"]
+            ):
+                outliers = [i for i, k in enumerate(pw_matched) if k < 0]
+                best_pw = {
+                    **base,
+                    "alignment_status": "PIECEWISE_BLOCK_ALIGNED",
+                    "aligned_protocol_marker_indices": pw_matched,
+                    "eeg_sync_offset_seconds": pw_offsets[0],
+                    "block_offsets_seconds": pw_offsets,
+                    "inlier_count": len(pw_inlier_errs),
+                    "median_abs_residual_seconds": round(float(np.median(pw_inlier_errs)), 4),
+                    "max_abs_residual_seconds": round(float(np.max(pw_inlier_errs)), 4),
+                    "per_marker_residuals_seconds": pw_resids,
+                    "replaced_outlier_indices": outliers,
+                }
+
+    # Step 4: Global RANSAC alignment
+    matched_r, offset_r, errs_r = _ransac_one_to_one_match(markers, eeg_arr, tol=1.0)
+    min_n = min(int(markers.size), int(eeg_arr.size))
+    req_inliers = max(3, int(math.ceil(0.75 * min_n)))
+    ransac_ok = (
+        len(errs_r) >= req_inliers
+        and float(np.median(errs_r)) <= 0.25
+    )
+
+    if best_pw is not None and (not ransac_ok or best_pw["inlier_count"] > len(errs_r)):
+        return best_pw
+
+    if ransac_ok:
+        resids = [
+            round(float((markers[i] + offset_r) - eeg_arr[k]), 4) if k >= 0 else None
+            for i, k in enumerate(matched_r)
+        ]
+        outliers = [i for i, k in enumerate(matched_r) if k < 0]
+        return {
+            **base,
+            "alignment_status": "RANSAC_INLINE_ALIGNED",
+            "aligned_protocol_marker_indices": matched_r,
+            "eeg_sync_offset_seconds": round(offset_r, 4),
+            "block_offsets_seconds": [round(offset_r, 4)],
+            "inlier_count": len(errs_r),
+            "median_abs_residual_seconds": round(float(np.median(errs_r)), 4),
+            "max_abs_residual_seconds": round(float(np.max(errs_r)), 4),
+            "per_marker_residuals_seconds": resids,
+            "replaced_outlier_indices": outliers,
+        }
+
+    if best_pw is not None:
+        return best_pw
+
+    # Step 5: Companion EEG protocol markers fallback
+    if eeg_arr.size >= 6 and len(errs_r) >= 2 and float(np.median(errs_r)) <= 0.40:
+        resids = [
+            round(float((markers[i] + offset_r) - eeg_arr[k]), 4) if k >= 0 else None
+            for i, k in enumerate(matched_r)
+        ]
+        outliers = [i for i, k in enumerate(matched_r) if k < 0]
+        return {
+            **base,
+            "alignment_status": "RANSAC_PARTIAL_EEG_COMPANION_ANCHORED",
+            "aligned_protocol_marker_indices": matched_r,
+            "eeg_sync_offset_seconds": round(offset_r, 4),
+            "block_offsets_seconds": [round(offset_r, 4)],
+            "inlier_count": len(errs_r),
+            "median_abs_residual_seconds": round(float(np.median(errs_r)), 4),
+            "max_abs_residual_seconds": round(float(np.max(errs_r)), 4),
+            "per_marker_residuals_seconds": resids,
+            "replaced_outlier_indices": outliers,
+        }
+
+    if eeg_arr.size >= 6:
+        return {
+            **base,
+            "alignment_status": "EEG_COMPANION_MARKERS_AVAILABLE",
+            "eeg_sync_offset_seconds": round(offset_r, 4) if errs_r else None,
+            "inlier_count": len(errs_r),
+            "median_abs_residual_seconds": round(float(np.median(errs_r)), 4) if errs_r else None,
+            "max_abs_residual_seconds": round(float(np.max(errs_r)), 4) if errs_r else None,
+        }
+
+    return base
 
 
 def preprocess_fnirs(recording: Path, destination: Path) -> dict[str, Any]:
@@ -928,6 +1321,82 @@ def preprocess_fnirs(recording: Path, destination: Path) -> dict[str, Any]:
     }
 
 
+def overlap_add_harmonic_cancel(
+    raw_2d: np.ndarray,
+    sample_rate: float,
+    win_sec: float = 10.0,
+    hop_sec: float = 2.5,
+    line_freq: float = 50.0,
+    max_freq: float = 450.0,
+    half_bw_hz: float = 1.35,
+) -> np.ndarray:
+    """Hann WOLA (weighted overlap-add) sinusoidal harmonic regression + 20-450 Hz Butterworth bandpass.
+
+    Applies a Hann analysis window before rfft (suppressing rectangular-window 1/f spectral
+    sidelobe leakage by >31 dB) and projects out the narrowband sinusoidal subspace at
+    50*k +/- half_bw_hz, then reconstructs via Hann synthesis window (normalized by sum(w^2))
+    with reflection boundary padding and 20-450 Hz 4th-order zero-phase Butterworth bandpass.
+    """
+    x = np.asarray(raw_2d, dtype=np.float64)
+    single_1d = x.ndim == 1
+    if single_1d:
+        x = x[None, :]
+    n_ch, n_samples = x.shape
+    x_det = signal.detrend(x, axis=-1, type="linear")
+    harmonics = [f for f in np.arange(line_freq, min(max_freq, sample_rate * 0.45) + 0.1, line_freq)]
+    upper = min(EMG_BAND_HZ[1], sample_rate * 0.45)
+    sos = signal.butter(4, (EMG_BAND_HZ[0], upper), btype="bandpass", fs=sample_rate, output="sos")
+    if not harmonics or n_samples < 64:
+        out = signal.sosfiltfilt(sos, x_det, axis=-1).astype(np.float32)
+        return out[0] if single_1d else out
+
+    win_len = min(max(256, int(round(win_sec * sample_rate))), max(256, n_samples))
+    if win_len % 2 == 1:
+        win_len += 1
+    hop_len = max(16, min(int(round(hop_sec * sample_rate)), win_len // 4))
+    pad_len = min(win_len // 2, n_samples - 1)
+    x_pad = np.pad(x_det, ((0, 0), (pad_len, pad_len)), mode="reflect")
+    n_pad = x_pad.shape[1]
+
+    if win_len >= n_pad:
+        starts = [0]
+        win_len = n_pad
+    else:
+        starts = list(range(0, n_pad - win_len + 1, hop_len))
+        if starts[-1] + win_len < n_pad:
+            starts.append(n_pad - win_len)
+
+    hann = np.maximum(np.hanning(win_len).astype(np.float64), 1e-3)
+    hann_sq = hann * hann
+
+    freqs = np.fft.rfftfreq(win_len, d=1.0 / sample_rate)
+    keep_bins = np.ones(freqs.size, dtype=bool)
+    for h_freq in harmonics:
+        keep_bins &= np.abs(freqs - h_freq) > half_bw_hz
+
+    acc = np.zeros((n_ch, n_pad), dtype=np.float64)
+    w_sum = np.zeros(n_pad, dtype=np.float64)
+    t_norm = np.linspace(-1.0, 1.0, win_len, dtype=np.float64)
+    t_norm_denom = float(np.sum(t_norm * t_norm))
+
+    for s in starts:
+        seg = x_pad[:, s : s + win_len]
+        seg_mean = np.mean(seg, axis=1, keepdims=True)
+        seg_slope = ((seg - seg_mean) @ t_norm)[:, None] / max(t_norm_denom, 1e-12)
+        trend = seg_mean + seg_slope * t_norm[None, :]
+        seg_win = (seg - trend) * hann[None, :]
+        spec = np.fft.rfft(seg_win, axis=-1)
+        spec[:, ~keep_bins] = 0.0
+        clean_win = np.fft.irfft(spec, n=win_len, axis=-1)
+        acc[:, s : s + win_len] += clean_win * hann[None, :] + trend * hann_sq[None, :]
+        w_sum[s : s + win_len] += hann_sq
+
+    deharm_pad = acc / np.maximum(w_sum[None, :], 1e-12)
+    deharm = deharm_pad[:, pad_len : pad_len + n_samples]
+    filtered = signal.sosfiltfilt(sos, deharm, axis=-1).astype(np.float32)
+    return filtered[0] if single_1d else filtered
+
+
 def preprocess_emg(recording: Path, destination: Path, *, save_debug_arrays: bool = False) -> dict[str, Any]:
     assert_writable_output_path(destination)
     series = read_emg_csv(recording, None)
@@ -990,7 +1459,7 @@ def preprocess_emg(recording: Path, destination: Path, *, save_debug_arrays: boo
         raw_resampled, _ = _resample(values[None, :], item.sample_rate_hz, target_rate)
         raw_cropped.append(raw_resampled[0][:common_samples])
         pre_line.append(_line_amplitude_median(before[None, :], item.sample_rate_hz))
-        filtered = _bandpass(_notch_harmonics(values[None, :], item.sample_rate_hz, EMG_BAND_HZ[1]), item.sample_rate_hz, EMG_BAND_HZ)[0]
+        filtered = overlap_add_harmonic_cancel(values[None, :], item.sample_rate_hz)[0]
         filtered_res, output_rate = _resample(filtered[None, :], item.sample_rate_hz, target_rate)
         filtered = filtered_res[0][:common_samples]
         out_t = np.arange(filtered.size, dtype=np.float64) / output_rate
@@ -1011,7 +1480,40 @@ def preprocess_emg(recording: Path, destination: Path, *, save_debug_arrays: boo
         envelope_5hz = np.abs(data).astype(np.float32)
     common_duration_output = (length - 1) / target_rate
     quality_scores = np.asarray([metric.quality_score for metric in channel_metrics], dtype=np.float32)
-    quality_status = np.asarray([metric.status for metric in channel_metrics], dtype="U8")
+    quality_status = np.asarray([metric.status for metric in channel_metrics], dtype="U24")
+
+    rescued_sensors: list[int] = []
+    for ch_idx, metric in enumerate(channel_metrics):
+        if metric.status == "POOR" and metric.line_noise_power_percent >= 85.0:
+            if (
+                metric.flat_epoch_percent < 10.0
+                and metric.repeated_extreme_percent < 1.0
+                and metric.missing_sample_percent < 5.0
+            ):
+                ch_filt = data[ch_idx]
+                ch_mask = sample_valid_mask[ch_idx]
+                ch_active = ch_filt[ch_mask] if np.count_nonzero(ch_mask) >= int(target_rate * 2) else ch_filt
+                env_ch = envelope_5hz[ch_idx]
+                env_active = env_ch[ch_mask] if np.count_nonzero(ch_mask) >= int(target_rate * 2) else env_ch
+                p20, p95 = np.percentile(env_active, [20, 95])
+                burst_mod = float(p95 / max(p20, 1e-12))
+
+                nper = min(int(round(target_rate * 2.0)), max(16, ch_active.size))
+                f_welch, p_welch = signal.welch(ch_active, fs=target_rate, nperseg=nper)
+                upper = min(EMG_BAND_HZ[1], target_rate * 0.45)
+                broad = _band_power(f_welch, p_welch, EMG_BAND_HZ[0], upper)
+                harm_post = 0.0
+                h = LINE_FREQUENCY_HZ
+                while h <= upper:
+                    harm_post += _band_power(f_welch, p_welch, h - 1.0, h + 1.0)
+                    h += LINE_FREQUENCY_HZ
+                post_line_pct = 100.0 * harm_post / max(broad, 1e-30)
+
+                if post_line_pct < 5.0 and burst_mod >= 2.0:
+                    quality_status[ch_idx] = "CAUTION_HIGH_RAW_LINE"
+                    quality_scores[ch_idx] = 65.0
+                    rescued_sensors.append(series[ch_idx].sensor_id)
+
     window_size = max(1, int(round(target_rate * EMG_EPOCH_SECONDS)))
     window_count = int(np.ceil(length / window_size))
     window_mask = np.zeros((len(series), window_count), dtype=bool)
@@ -1020,26 +1522,19 @@ def preprocess_emg(recording: Path, destination: Path, *, save_debug_arrays: boo
         window_mask[channel_index], window_weight[channel_index] = emg_window_quality(
             data[channel_index],
             target_rate,
-            metric.quality_score,
+            float(quality_scores[channel_index]),
             raw_values=raw_data[channel_index],
             valid_sample_mask=sample_valid_mask[channel_index],
         )
-    # POOR channels remain in the file for auditability, but are not eligible
-    # for primary signal features. CAUTION channels remain usable with an
-    # explicit quality weight in downstream analyses.
     sensor_ids = np.asarray([item.sensor_id for item in series], dtype=np.int16)
     muscle_indices = np.asarray(
         [item.muscle_index if item.muscle_index is not None else -1 for item in series], dtype=np.int16
     )
-    # Primary features use resolved logical muscles. Physical IDs remain in
-    # the NPZ for auditability and are never used as cross-record labels.
     expected_sensor_mask = np.asarray(
         [mapping["mapping_valid_for_primary_features"] and item.muscle_index is not None for item in series],
         dtype=bool,
     )
-    # A channel is eligible only when QC produced an explicit usable status.
-    # UNKNOWN is audit-only and must not pass the gate by default.
-    signal_gate = np.isin(quality_status, ("GOOD", "CAUTION")) & expected_sensor_mask
+    signal_gate = np.isin(quality_status, ("GOOD", "CAUTION", "CAUTION_HIGH_RAW_LINE")) & expected_sensor_mask
     missing_sensor_ids = mapping["mapping_missing_sensor_ids"]
     unexpected_sensor_ids = mapping["mapping_unexpected_sensor_ids"]
     canonical_missing_sensor_ids = mapping["canonical_missing_sensor_ids"]
@@ -1093,6 +1588,7 @@ def preprocess_emg(recording: Path, destination: Path, *, save_debug_arrays: boo
         "quality_degradation": quality_degradation,
         "protocol_duration_complete": protocol_complete,
         "early_terminated_sensor_ids": early_terminated_sensors,
+        "rescued_high_raw_line_sensor_ids": rescued_sensors,
         "gap_repaired_sensor_ids": gap_repaired_sensors,
         "bandpass_hz": EMG_BAND_HZ,
         "notch_hz": list(np.arange(LINE_FREQUENCY_HZ, EMG_BAND_HZ[1] + 0.1, LINE_FREQUENCY_HZ)),
@@ -1119,8 +1615,8 @@ def preprocess_emg(recording: Path, destination: Path, *, save_debug_arrays: boo
         "unexpected_sensor_ids": unexpected_sensor_ids,
         "canonical_missing_sensor_ids": canonical_missing_sensor_ids,
         "canonical_unexpected_sensor_ids": canonical_unexpected_sensor_ids,
-        "channel_quality_scores": {str(item.sensor_id): round(float(metric.quality_score), 3) for item, metric in zip(series, channel_metrics)},
-        "channel_quality_status": {str(item.sensor_id): metric.status for item, metric in zip(series, channel_metrics)},
+        "channel_quality_scores": {str(item.sensor_id): round(float(quality_scores[idx]), 3) for idx, item in enumerate(series)},
+        "channel_quality_status": {str(item.sensor_id): str(quality_status[idx]) for idx, item in enumerate(series)},
         "analysis_rule_channel_gate": "保留所有传感器及质量证据；主特征要求 mapping_valid_for_primary_features=True 且非 POOR，CAUTION 传感器需携带质量分数或降权；跨记录按逻辑肌肉索引对齐。",
         "window_quality": {
             "window_seconds": EMG_EPOCH_SECONDS,

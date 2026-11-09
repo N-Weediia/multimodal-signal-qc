@@ -70,8 +70,12 @@ def configure_summary_only() -> None:
 
 
 # -------- Settings intended for local adjustment --------
-DEFAULT_DATA_ROOT = Path("data") if Path("data").is_dir() else (
-    Path("data_repro_20260903") if Path("data_repro_20260903").is_dir() else Path("data")
+DEFAULT_DATA_ROOT = (
+    Path("J:/2026\u4e8c\u5eb7")
+    if Path("J:/2026\u4e8c\u5eb7").is_dir()
+    else (Path("data") if Path("data").is_dir() else (
+        Path("data_repro_20260903") if Path("data_repro_20260903").is_dir() else Path("data")
+    ))
 )
 DEFAULT_RESULTS_ROOT = Path("outputs/qc/current")
 KNOWN_SESSIONS = ("base_line", "sec_test", "thi_test", "sec")
@@ -634,16 +638,22 @@ def clamp_eeg_disconnect_epochs(
     if n_ep < 3:
         return raw.copy(), np.zeros(n_ep, dtype=bool)
     raw_ep = raw[:, : n_ep * ep_len].reshape(raw.shape[0], n_ep, ep_len)
-    med_p2p = np.median(np.ptp(raw_ep, axis=2), axis=0)
+    med_p2p_raw = np.median(np.ptp(raw_ep, axis=2), axis=0)
+
+    # Remove per-channel within-epoch DC offset before sample-wise median reference
+    raw_ep_centered = raw_ep - np.median(raw_ep, axis=2, keepdims=True)
+    reref_ep = raw_ep_centered - np.median(raw_ep_centered, axis=0, keepdims=True)
+    med_p2p_reref = np.median(np.ptp(reref_ep, axis=2), axis=0)
+
     if digital is not None and digital_min is not None and digital_max is not None:
         dig_ep = digital[:, : n_ep * ep_len].reshape(digital.shape[0], n_ep, ep_len)
         clipped_frac = np.mean(
             np.any((dig_ep <= digital_min[:, None, None]) | (dig_ep >= digital_max[:, None, None]), axis=2),
             axis=0,
         )
-        disconnect = (clipped_frac >= 0.25) | (med_p2p > 2500.0)
+        disconnect = (clipped_frac >= 0.25) | (med_p2p_reref > 2500.0) | (med_p2p_raw > 50000.0)
     else:
-        disconnect = med_p2p > 2500.0
+        disconnect = (med_p2p_reref > 2500.0) | (med_p2p_raw > 50000.0)
     if not np.any(disconnect) or np.mean(disconnect) >= 0.50:
         return raw.copy(), np.zeros(n_ep, dtype=bool)
     dilated = np.convolve(disconnect.astype(int), [1, 1, 1], mode="same") > 0
